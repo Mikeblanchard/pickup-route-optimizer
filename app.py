@@ -80,32 +80,79 @@ if page == "Update Master Data":
     st.markdown("---")
 
     with st.form("update_form", clear_on_submit=False):
-        st.subheader("Upload new files")
-        gap_uploads = st.file_uploader(
-            "Upload GAP Excel files",
+        st.subheader("Upload new Excel files")
+        uploaded_files = st.file_uploader(
+            "Upload GAP and pickup Excel files together",
             type=["xlsx", "xls"],
             accept_multiple_files=True,
-            key="gap_uploads",
-        )
-        pickup_uploads = st.file_uploader(
-            "Upload pickup Excel files",
-            type=["xlsx", "xls"],
-            accept_multiple_files=True,
-            key="pickup_uploads",
+            key="mixed_uploads",
         )
 
         run_update = st.form_submit_button("Update Master Data")
 
+    if uploaded_files:
+        detected_gap_files = []
+        detected_pickup_files = []
+        unknown_files = []
+
+        for f in uploaded_files:
+            try:
+                preview_df = pd.read_excel(f, nrows=5)
+                cols = set(preview_df.columns.astype(str))
+
+                if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
+                    detected_gap_files.append(f.name)
+                elif {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
+                    detected_pickup_files.append(f.name)
+                else:
+                    unknown_files.append(f.name)
+            except Exception:
+                unknown_files.append(f.name)
+
+        st.markdown("### Detected file types")
+        st.write(f"GAP files detected: **{len(detected_gap_files)}**")
+        if detected_gap_files:
+            st.write(detected_gap_files)
+
+        st.write(f"Pickup files detected: **{len(detected_pickup_files)}**")
+        if detected_pickup_files:
+            st.write(detected_pickup_files)
+
+        if unknown_files:
+            st.write(f"Unknown files: **{len(unknown_files)}**")
+            st.write(unknown_files)
+
     if run_update:
-        if not gap_uploads and not pickup_uploads:
-            st.warning("Please upload at least one GAP or pickup file.")
+        if not uploaded_files:
+            st.warning("Please upload at least one Excel file.")
         else:
+            gap_file_objs = []
+            pickup_file_objs = []
+            unknown_files = []
+
+            for f in uploaded_files:
+                try:
+                    preview_df = pd.read_excel(f, nrows=5)
+                    cols = set(preview_df.columns.astype(str))
+
+                    if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
+                        gap_file_objs.append(f)
+                    elif {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
+                        pickup_file_objs.append(f)
+                    else:
+                        unknown_files.append(f.name)
+                except Exception:
+                    unknown_files.append(f.name)
+
             with st.spinner("Reading uploaded files..."):
-                gap_new_raw = read_uploaded_excels(gap_uploads)
-                pickup_new_raw = read_uploaded_excels(pickup_uploads)
+                gap_new_raw = read_uploaded_excels(gap_file_objs)
+                pickup_new_raw = read_uploaded_excels(pickup_file_objs)
 
             st.write("New GAP raw rows:", len(gap_new_raw))
             st.write("New pickup raw rows:", len(pickup_new_raw))
+
+            if unknown_files:
+                st.warning(f"Skipped unknown files: {unknown_files}")
 
             with st.spinner("Standardizing files..."):
                 gap_new = standardize_gap(gap_new_raw) if not gap_new_raw.empty else pd.DataFrame()
@@ -136,7 +183,7 @@ if page == "Update Master Data":
                     key_cols=["pickup_key"]
                 )
 
-                log_new = build_ingestion_log_entries(gap_uploads, pickup_uploads)
+                log_new = build_ingestion_log_entries(gap_file_objs, pickup_file_objs)
                 ingestion_log_updated = append_ingestion_log(ingestion_log, log_new)
 
                 save_master_tables(
@@ -154,7 +201,10 @@ if page == "Update Master Data":
             st.write("Updated pickup stops master rows:", len(pickup_stops_master_updated))
 
             st.markdown("### Sample of updated pickup stops")
-            st.dataframe(pickup_stops_master_updated.head(25), use_container_width=True)
+            if not pickup_stops_master_updated.empty:
+                st.dataframe(pickup_stops_master_updated.head(25), use_container_width=True)
+            else:
+                st.info("No pickup stops are currently in master data.")
 
     st.markdown("---")
     st.subheader("Download current master files")

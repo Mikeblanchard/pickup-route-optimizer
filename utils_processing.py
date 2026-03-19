@@ -62,50 +62,7 @@ def load_master_tables(paths):
 
     return gap_master, pickup_master, pickup_stops_master, ingestion_log
 
-
-
-def _prepare_for_parquet(df):
-    if df is None or df.empty:
-        return df.copy() if df is not None else pd.DataFrame()
-
-    out = df.copy()
-
-    for col in out.columns:
-        s = out[col]
-
-        if pd.api.types.is_datetime64_any_dtype(s):
-            continue
-
-        non_null = s.dropna()
-        sample = non_null.iloc[:20] if len(non_null) else non_null
-
-        if len(sample) == 0:
-            continue
-
-        # Python time/date objects and mixed object columns often break parquet writes.
-        if sample.map(lambda x: isinstance(x, time)).any():
-            out[col] = s.astype(str).replace({"NaT": np.nan, "None": np.nan, "nan": np.nan})
-            continue
-
-        if sample.map(lambda x: hasattr(x, "isoformat") and not isinstance(x, (str, bytes, pd.Timestamp))).any():
-            try:
-                out[col] = pd.to_datetime(s, errors="ignore")
-            except Exception:
-                out[col] = s.astype(str).replace({"NaT": np.nan, "None": np.nan, "nan": np.nan})
-            continue
-
-        if s.dtype == "object":
-            py_types = {type(x).__name__ for x in sample}
-            if len(py_types) > 1:
-                out[col] = s.astype(str).replace({"NaT": np.nan, "None": np.nan, "nan": np.nan})
-
-    return out
-
 def save_master_tables(paths, gap_master, pickup_master, pickup_stops_master, ingestion_log):
-    gap_master = _prepare_for_parquet(gap_master)
-    pickup_master = _prepare_for_parquet(pickup_master)
-    pickup_stops_master = _prepare_for_parquet(pickup_stops_master)
-
     gap_master.to_parquet(paths["master"] / "gap_master.parquet", index=False)
     pickup_master.to_parquet(paths["master"] / "pickup_master.parquet", index=False)
     pickup_stops_master.to_parquet(paths["master"] / "pickup_stops_master.parquet", index=False)

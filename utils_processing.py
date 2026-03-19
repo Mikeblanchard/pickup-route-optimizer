@@ -41,14 +41,37 @@ def ensure_data_dirs(base_dir="streamlit_data"):
     return paths
 
 def load_master_tables(paths):
-    gap_path = paths["master"] / "gap_master.parquet"
-    pickup_path = paths["master"] / "pickup_master.parquet"
-    pickup_stops_path = paths["master"] / "pickup_stops_master.parquet"
+    gap_pkl = paths["master"] / "gap_master.pkl"
+    pickup_pkl = paths["master"] / "pickup_master.pkl"
+    pickup_stops_pkl = paths["master"] / "pickup_stops_master.pkl"
     log_path = paths["master"] / "ingestion_log.csv"
 
-    gap_master = pd.read_parquet(gap_path) if gap_path.exists() else pd.DataFrame()
-    pickup_master = pd.read_parquet(pickup_path) if pickup_path.exists() else pd.DataFrame()
-    pickup_stops_master = pd.read_parquet(pickup_stops_path) if pickup_stops_path.exists() else pd.DataFrame()
+    # Backward-compatible fallback to old parquet files if they exist.
+    gap_parquet = paths["master"] / "gap_master.parquet"
+    pickup_parquet = paths["master"] / "pickup_master.parquet"
+    pickup_stops_parquet = paths["master"] / "pickup_stops_master.parquet"
+
+    if gap_pkl.exists():
+        gap_master = pd.read_pickle(gap_pkl)
+    elif gap_parquet.exists():
+        gap_master = pd.read_parquet(gap_parquet)
+    else:
+        gap_master = pd.DataFrame()
+
+    if pickup_pkl.exists():
+        pickup_master = pd.read_pickle(pickup_pkl)
+    elif pickup_parquet.exists():
+        pickup_master = pd.read_parquet(pickup_parquet)
+    else:
+        pickup_master = pd.DataFrame()
+
+    if pickup_stops_pkl.exists():
+        pickup_stops_master = pd.read_pickle(pickup_stops_pkl)
+    elif pickup_stops_parquet.exists():
+        pickup_stops_master = pd.read_parquet(pickup_stops_parquet)
+    else:
+        pickup_stops_master = pd.DataFrame()
+
     ingestion_log = pd.read_csv(log_path) if log_path.exists() else pd.DataFrame()
 
     for df, cols in [
@@ -63,9 +86,10 @@ def load_master_tables(paths):
     return gap_master, pickup_master, pickup_stops_master, ingestion_log
 
 def save_master_tables(paths, gap_master, pickup_master, pickup_stops_master, ingestion_log):
-    gap_master.to_parquet(paths["master"] / "gap_master.parquet", index=False)
-    pickup_master.to_parquet(paths["master"] / "pickup_master.parquet", index=False)
-    pickup_stops_master.to_parquet(paths["master"] / "pickup_stops_master.parquet", index=False)
+    # Use pickle for app storage because Excel-derived mixed object columns can break pyarrow/parquet.
+    gap_master.to_pickle(paths["master"] / "gap_master.pkl")
+    pickup_master.to_pickle(paths["master"] / "pickup_master.pkl")
+    pickup_stops_master.to_pickle(paths["master"] / "pickup_stops_master.pkl")
     ingestion_log.to_csv(paths["master"] / "ingestion_log.csv", index=False)
 
 def clean_text(x):

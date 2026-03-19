@@ -63,10 +63,19 @@ if page == "Update Master Data":
         st.write(f"Ingestion log rows: **{len(ingestion_log):,}**")
 
     with c2:
-        if not gap_master.empty:
-            st.write("GAP dates:", f"{gap_master['scan_date'].min()} to {gap_master['scan_date'].max()}")
-        if not pickup_master.empty:
-            st.write("Pickup dates:", f"{pickup_master['pickup_date'].min()} to {pickup_master['pickup_date'].max()}")
+        if not gap_master.empty and "scan_date" in gap_master.columns:
+            gap_dates = pd.to_datetime(gap_master["scan_date"], errors="coerce").dropna()
+            if not gap_dates.empty:
+                st.write("GAP dates:", f"{gap_dates.min().date()} to {gap_dates.max().date()}")
+            else:
+                st.write("GAP dates: none detected")
+
+        if not pickup_master.empty and "pickup_date" in pickup_master.columns:
+            pickup_dates = pd.to_datetime(pickup_master["pickup_date"], errors="coerce").dropna()
+            if not pickup_dates.empty:
+                st.write("Pickup dates:", f"{pickup_dates.min().date()} to {pickup_dates.max().date()}")
+            else:
+                st.write("Pickup dates: none detected")
 
     st.markdown("---")
 

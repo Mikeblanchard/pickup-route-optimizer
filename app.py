@@ -211,26 +211,26 @@ if page == "Update Master Data":
 
     if not gap_master.empty:
         st.download_button(
-            "Download gap_master.parquet",
-            data=gap_master.to_parquet(index=False),
-            file_name="gap_master.parquet",
-            mime="application/octet-stream",
+            "Download gap_master.csv",
+            data=gap_master.to_csv(index=False).encode("utf-8"),
+            file_name="gap_master.csv",
+            mime="text/csv",
         )
 
     if not pickup_master.empty:
         st.download_button(
-            "Download pickup_master.parquet",
-            data=pickup_master.to_parquet(index=False),
-            file_name="pickup_master.parquet",
-            mime="application/octet-stream",
+            "Download pickup_master.csv",
+            data=pickup_master.to_csv(index=False).encode("utf-8"),
+            file_name="pickup_master.csv",
+            mime="text/csv",
         )
 
     if not pickup_stops_master.empty:
         st.download_button(
-            "Download pickup_stops_master.parquet",
-            data=pickup_stops_master.to_parquet(index=False),
-            file_name="pickup_stops_master.parquet",
-            mime="application/octet-stream",
+            "Download pickup_stops_master.csv",
+            data=pickup_stops_master.to_csv(index=False).encode("utf-8"),
+            file_name="pickup_stops_master.csv",
+            mime="text/csv",
         )
 
     if not ingestion_log.empty:

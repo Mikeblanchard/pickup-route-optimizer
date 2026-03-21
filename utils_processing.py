@@ -34,6 +34,7 @@ def ensure_data_dirs(base_dir="streamlit_data"):
         "master": base / "master",
         "cache": base / "cache",
         "outputs": base / "outputs",
+        "anchors": base / "anchors",
     }
     for p in paths.values():
         p.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,94 @@ def save_master_tables(paths, gap_master, pickup_master, pickup_stops_master, st
     pickup_stops_master.to_pickle(paths["master"] / "pickup_stops_master.pkl")
     stop_detail_master.to_pickle(paths["master"] / "stop_detail_master.pkl")
     ingestion_log.to_csv(paths["master"] / "ingestion_log.csv", index=False)
+
+
+def normalize_work_area_key(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip().upper()
+    if not s:
+        return None
+    m = re.search(r"(\d{3,4})", s)
+    if not m:
+        return None
+    try:
+        return str(int(m.group(1)))
+    except Exception:
+        return m.group(1).lstrip("0") or m.group(1)
+
+def format_work_area_display(x):
+    key = normalize_work_area_key(x)
+    if key is None:
+        return ""
+    return key.zfill(4)
+
+def load_anchor_references(paths):
+    anchor_meta_path = paths["anchors"] / "anchor_references.csv"
+    if not anchor_meta_path.exists():
+        return pd.DataFrame(columns=[
+            "work_area_key", "wave", "version", "is_active", "effective_date",
+            "uploaded_at", "original_file_name", "saved_file_name", "saved_path", "notes"
+        ])
+    refs = pd.read_csv(anchor_meta_path)
+    for c in ["effective_date", "uploaded_at"]:
+        if c in refs.columns:
+            refs[c] = pd.to_datetime(refs[c], errors="coerce")
+    if "is_active" in refs.columns:
+        refs["is_active"] = refs["is_active"].fillna(False).astype(bool)
+    return refs
+
+def save_anchor_references(paths, anchor_refs):
+    anchor_meta_path = paths["anchors"] / "anchor_references.csv"
+    out = anchor_refs.copy()
+    out.to_csv(anchor_meta_path, index=False)
+
+def append_or_replace_anchor_reference(paths, existing_refs, uploaded_file, work_area_input, wave="", effective_date=None, notes=""):
+    work_area_key = normalize_work_area_key(work_area_input)
+    if work_area_key is None:
+        raise ValueError("Invalid work area input.")
+
+    refs = existing_refs.copy() if existing_refs is not None else pd.DataFrame()
+    if refs.empty:
+        refs = pd.DataFrame(columns=[
+            "work_area_key", "wave", "version", "is_active", "effective_date",
+            "uploaded_at", "original_file_name", "saved_file_name", "saved_path", "notes"
+        ])
+
+    if "work_area_key" in refs.columns:
+        same_mask = refs["work_area_key"].astype(str) == str(work_area_key)
+        refs.loc[same_mask, "is_active"] = False
+        existing_versions = pd.to_numeric(refs.loc[same_mask, "version"], errors="coerce").dropna()
+        next_version = int(existing_versions.max()) + 1 if not existing_versions.empty else 1
+    else:
+        next_version = 1
+
+    original_name = getattr(uploaded_file, "name", "anchor_upload")
+    suffix = Path(original_name).suffix.lower() or ".bin"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem)
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    saved_file_name = f"anchor_{work_area_key}_v{next_version}_{timestamp}_{safe_name}{suffix}"
+    saved_path = paths["anchors"] / saved_file_name
+
+    content = uploaded_file.getvalue()
+    saved_path.write_bytes(content)
+
+    new_row = pd.DataFrame([{
+        "work_area_key": str(work_area_key),
+        "wave": clean_text(wave) if wave else "",
+        "version": next_version,
+        "is_active": True,
+        "effective_date": pd.Timestamp(effective_date) if effective_date else pd.NaT,
+        "uploaded_at": pd.Timestamp.now(),
+        "original_file_name": original_name,
+        "saved_file_name": saved_file_name,
+        "saved_path": str(saved_path),
+        "notes": clean_text(notes) if notes else "",
+    }])
+
+    refs = pd.concat([refs, new_row], ignore_index=True)
+    save_anchor_references(paths, refs)
+    return refs
 
 def clean_text(x):
     if pd.isna(x):

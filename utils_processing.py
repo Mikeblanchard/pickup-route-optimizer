@@ -421,7 +421,25 @@ def standardize_pickups(df):
 
     if "postal_code" in p.columns:
         p["postal_code"] = p["postal_code"].apply(normalize_postal_code)
+    if "work_area_no" in p.columns:
+    p["work_area_no"] = (
+        p["work_area_no"]
+        .astype(str)
+        .str.extract(r"(\d{3,4})", expand=False)
+        .fillna("")
+        .apply(lambda x: str(int(x)) if x else "")
+    )
 
+if "work_area" in p.columns:
+    p["work_area_key"] = (
+        p["work_area"]
+        .astype(str)
+        .str.extract(r"(\d{3,4})", expand=False)
+        .fillna("")
+        .apply(lambda x: str(int(x)) if x else "")
+    )
+else:
+    p["work_area_key"] = p["work_area_no"]
     p["pickup_date"] = to_date_col(p["pickup_date"]) if "pickup_date" in p.columns else pd.NaT
 
     p["ready_pickup_time_only"] = to_time_only(p["ready_pickup_time"]) if "ready_pickup_time" in p.columns else None
@@ -441,7 +459,7 @@ def standardize_pickups(df):
     p["wave_label"] = [x[1] for x in inferred]
     p["wave_start_dt"] = p.apply(lambda r: combine_date_and_time(r["pickup_date"], r["wave_start_time"]), axis=1)
 
-    p["route"] = p["work_area_no"].astype("Int64") if "work_area_no" in p.columns else pd.Series(dtype="Int64")
+    p["route"] = pd.to_numeric(p["work_area_no"], errors="coerce").astype("Int64") if "work_area_no" in p.columns else pd.Series(dtype="Int64")
     p["reason_text"] = p["reason_code"].map(APP_CONFIG["reason_code_map"]).fillna("") if "reason_code" in p.columns else ""
 
     return p

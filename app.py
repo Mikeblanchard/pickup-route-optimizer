@@ -10,6 +10,10 @@ from utils_processing import (
     ensure_data_dirs,
     load_master_tables,
     save_master_tables,
+    load_anchor_references,
+    append_or_replace_anchor_reference,
+    normalize_work_area_key,
+    format_work_area_display,
     read_uploaded_excels,
     read_stop_detail_file,
     standardize_gap,
@@ -53,6 +57,7 @@ storage_root = st.sidebar.text_input(
 paths = ensure_data_dirs(storage_root)
 
 gap_master, pickup_master, pickup_stops_master, stop_detail_master, ingestion_log = load_master_tables(paths)
+anchor_refs = load_anchor_references(paths)
 
 def _csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -263,7 +268,77 @@ if page == "Update Master Data":
                 st.markdown("### Sample of updated stop-detail master")
                 st.dataframe(stop_detail_master_updated.head(25), use_container_width=True)
 
+
     st.markdown("---")
+    st.subheader("Anchor Area Manager")
+    st.caption("Upload anchor reference images/files by work area. New uploads for the same work area replace the active version and archive older ones.")
+
+    with st.form("anchor_upload_form", clear_on_submit=True):
+        ac1, ac2, ac3 = st.columns([1, 1, 1.4])
+        with ac1:
+            anchor_work_area_input = st.text_input(
+                "Work Area / Route Number",
+                help="Enter 745, 0745, or a string like W1-745. The app stores it internally as 745."
+            )
+        with ac2:
+            anchor_wave = st.selectbox("Wave (optional)", ["", "W1", "W2"], index=0)
+        with ac3:
+            anchor_effective_date = st.date_input("Effective Date (optional)", value=None)
+
+        anchor_notes = st.text_input("Notes (optional)")
+        anchor_upload = st.file_uploader(
+            "Upload anchor image/file",
+            type=["png", "jpg", "jpeg", "webp", "pdf", "kml", "kmz", "geojson", "json"],
+            accept_multiple_files=False,
+            key="anchor_upload_single",
+        )
+        save_anchor = st.form_submit_button("Save / Replace Anchor")
+
+    if save_anchor:
+        if anchor_upload is None:
+            st.warning("Please upload an anchor file before saving.")
+        elif not normalize_work_area_key(anchor_work_area_input):
+            st.warning("Please enter a valid Work Area / Route Number before saving.")
+        else:
+            updated_anchor_refs = append_or_replace_anchor_reference(
+                paths=paths,
+                existing_refs=anchor_refs,
+                uploaded_file=anchor_upload,
+                work_area_input=anchor_work_area_input,
+                wave=anchor_wave,
+                effective_date=anchor_effective_date,
+                notes=anchor_notes,
+            )
+            anchor_refs = updated_anchor_refs
+            st.success(
+                f"Saved anchor for work area {format_work_area_display(normalize_work_area_key(anchor_work_area_input))}."
+            )
+
+    st.markdown("### Current Anchor References")
+    if anchor_refs.empty:
+        st.info("No anchor references uploaded yet.")
+    else:
+        anchor_display = anchor_refs.copy()
+        if "work_area_key" in anchor_display.columns:
+            anchor_display["display_work_area"] = anchor_display["work_area_key"].astype(str).map(format_work_area_display)
+        display_cols = [
+            "display_work_area",
+            "work_area_key",
+            "wave",
+            "version",
+            "is_active",
+            "effective_date",
+            "uploaded_at",
+            "original_file_name",
+            "saved_file_name",
+            "notes",
+        ]
+        display_cols = [c for c in display_cols if c in anchor_display.columns]
+        st.dataframe(
+            anchor_display.sort_values(["work_area_key", "version"], ascending=[True, False])[display_cols],
+            use_container_width=True,
+        )
+
     st.subheader("Download current master files")
 
     if not gap_master.empty:

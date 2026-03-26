@@ -288,7 +288,7 @@ if page == "Update Master Data":
         anchor_notes = st.text_input("Notes (optional)")
         anchor_upload = st.file_uploader(
             "Upload anchor image/file",
-            type=["png", "jpg", "jpeg", "webp", "pdf", "kml", "kmz", "geojson", "json"],
+            type=["png", "jpg", "jpeg", "webp", "pdf", "kml", "kmz", "geojson", "json", "snag"],
             accept_multiple_files=False,
             key="anchor_upload_single",
         )

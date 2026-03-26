@@ -6,6 +6,7 @@ from datetime import datetime, time
 import numpy as np
 import pandas as pd
 
+
 APP_CONFIG = {
     "station_address": "45 Di Poce Way Vaughan, ON L4H 4J4",
     "wave_starts": {

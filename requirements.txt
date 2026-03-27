@@ -3,3 +3,4 @@ pandas
 numpy
 openpyxl
 pyarrow
+from bs4 import BeautifulSoup

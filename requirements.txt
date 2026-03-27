@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy
 openpyxl
-pyarrow
-from bs4 import BeautifulSoup
+beautifulsoup4
+lxml
+numpy

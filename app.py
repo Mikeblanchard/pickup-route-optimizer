@@ -9,7 +9,7 @@ from utils_processing import (
     append_dedup,
     append_ingestion_log,
     append_or_replace_anchor_reference,
-    build_courier_day_changes,
+    build_route_performance_benchmarks,
     build_ingestion_log_entries,
     build_route_day_summary,
     consolidate_physical_pickups,
@@ -455,7 +455,7 @@ elif page == "Analyze Existing Master":
                 route_day_summary = build_route_day_summary(gap_f, pickup_stops_f)
                 best_matches, match_report = match_pickups_to_gap(gap_f, pickup_stops_f, tolerance_min=tolerance)
                 stop_detail_xref = cross_reference_stop_detail(stop_detail_f, gap_f, pickup_master) if not stop_detail_f.empty else pd.DataFrame()
-                courier_changes = build_courier_day_changes(metrics_f)
+                route_performance_benchmarks = build_route_performance_benchmarks(metrics_f)
 
             st.subheader("Courier day performance")
             if metrics_f.empty:
@@ -480,26 +480,29 @@ elif page == "Analyze Existing Master":
                     st.metric("Avg ST/H OR", round(float(metrics_f["actual_sth_or"].dropna().mean()), 2) if metrics_f["actual_sth_or"].notna().any() else "—")
                 with k4:
                     st.metric("Avg GAP sum/day", round(float(metrics_f["gap_sum_minutes_all"].dropna().mean()), 1) if "gap_sum_minutes_all" in metrics_f.columns and metrics_f["gap_sum_minutes_all"].notna().any() else "—")
-
-            st.subheader("Courier changes over uploaded days")
-            if courier_changes.empty:
-                st.info("Not enough courier-day rows to calculate changes yet.")
+            st.subheader("Route performance benchmarks")
+            if route_performance_benchmarks.empty:
+                st.info("Not enough route-day rows to calculate route benchmarks yet.")
             else:
-                change_cols = [
-                    "scan_date", "route", "courier_name", "fedex_id", "previous_date", "previous_route",
-                    "actual_sth_oa", "delta_actual_sth_oa",
-                    "actual_sth_or", "delta_actual_sth_or",
-                    "gap_sum_minutes_all", "delta_gap_sum_minutes_all",
-                    "gap_sum_minutes_customer", "delta_gap_sum_minutes_customer",
-                    "total_stops_actual", "delta_total_stops_actual",
-                    "customer_stop_count", "delta_customer_stop_count",
+                benchmark_cols = [
+                    "scan_date", "weekday", "route", "courier_name", "fedex_id",
+                    "actual_sth_oa", "route_all_history_avg_sth_oa", "delta_vs_route_all_history_sth_oa",
+                    "actual_sth_or", "route_all_history_avg_sth_or", "delta_vs_route_all_history_sth_or",
+                    "route_prev_7_obs_avg_sth_oa", "delta_vs_route_prev_7_obs_sth_oa",
+                    "route_prev_7_obs_avg_sth_or", "delta_vs_route_prev_7_obs_sth_or",
+                    "route_same_weekday_avg_sth_oa", "delta_vs_route_same_weekday_sth_oa",
+                    "route_same_weekday_avg_sth_or", "delta_vs_route_same_weekday_sth_or",
+                    "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual",
                 ]
-                change_cols = [c for c in change_cols if c in courier_changes.columns]
-                st.dataframe(courier_changes[change_cols], use_container_width=True)
+                benchmark_cols = [c for c in benchmark_cols if c in route_performance_benchmarks.columns]
+                st.dataframe(
+                    route_performance_benchmarks.sort_values(["scan_date", "route", "courier_name"])[benchmark_cols],
+                    use_container_width=True,
+                )
                 st.download_button(
-                    "Download courier_changes_over_days.csv",
-                    data=_csv_bytes(courier_changes),
-                    file_name="courier_changes_over_days.csv",
+                    "Download route_performance_benchmarks.csv",
+                    data=_csv_bytes(route_performance_benchmarks),
+                    file_name="route_performance_benchmarks.csv",
                     mime="text/csv",
                 )
 

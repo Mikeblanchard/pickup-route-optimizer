@@ -1143,25 +1143,74 @@ def enrich_gap_route_metrics_from_stops(gap_route_metrics_df, gap_stops_df):
     return out
 
 
-def build_courier_day_changes(gap_route_metrics_df):
+def build_route_performance_benchmarks(gap_route_metrics_df):
     if gap_route_metrics_df is None or gap_route_metrics_df.empty:
         return pd.DataFrame()
-    df = gap_route_metrics_df.copy()
-    df["scan_date"] = pd.to_datetime(df["scan_date"], errors="coerce")
-    df["fedex_id"] = df["fedex_id"].astype(str)
-    sort_cols = [c for c in ["fedex_id", "scan_date", "route"] if c in df.columns]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
 
-    diff_cols = [
-        "actual_sth_oa", "actual_sth_or", "actual_hr_oa_min", "actual_hr_or_min",
-        "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual", "customer_stop_count", "miles_on_road",
-    ]
-    group = df.groupby("fedex_id", dropna=False)
-    df["previous_date"] = group["scan_date"].shift(1)
+    df = gap_route_metrics_df.copy()
+    df["scan_date"] = pd.to_datetime(df["scan_date"], errors="coerce").dt.normalize()
     if "route" in df.columns:
-        df["previous_route"] = group["route"].shift(1)
-    for c in diff_cols:
-        if c in df.columns:
-            df[f"prev_{c}"] = group[c].shift(1)
-            df[f"delta_{c}"] = df[c] - df[f"prev_{c}"]
-    return df
+        df["route"] = pd.to_numeric(df["route"], errors="coerce").astype("Int64")
+    if "fedex_id" in df.columns:
+        df["fedex_id"] = df["fedex_id"].astype(str)
+    if "courier_name" in df.columns:
+        df["courier_name"] = df["courier_name"].apply(clean_text)
+
+    df["weekday"] = df["scan_date"].dt.day_name()
+    df = df.sort_values([c for c in ["route", "scan_date", "courier_name", "fedex_id"] if c in df.columns]).reset_index(drop=True)
+
+    metric_cols = [
+        "actual_sth_oa", "actual_sth_or", "actual_hr_oa_min", "actual_hr_or_min",
+        "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual",
+        "customer_stop_count", "pickup_stop_count", "delivery_stop_count",
+        "miles_on_road", "total_paid_hours_min",
+    ]
+    metric_cols = [c for c in metric_cols if c in df.columns]
+
+    # Station-wide benchmarks across all uploaded data
+    for metric in [c for c in ["actual_sth_oa", "actual_sth_or"] if c in df.columns]:
+        df[f"overall_all_data_avg_{metric}"] = df[metric].mean(skipna=True)
+        df[f"delta_vs_overall_all_data_{metric}"] = df[metric] - df[f"overall_all_data_avg_{metric}"]
+        denom = df[f"overall_all_data_avg_{metric}"].replace(0, np.nan)
+        df[f"pct_vs_overall_all_data_{metric}"] = (df[f"delta_vs_overall_all_data_{metric}"] / denom) * 100.0
+
+    if "route" not in df.columns:
+        return df
+
+    route_groups = []
+    for route, grp in df.groupby("route", dropna=False, sort=False):
+        grp = grp.sort_values("scan_date").copy()
+
+        for metric in metric_cols:
+            grp[f"route_all_history_avg_{metric}"] = grp[metric].mean(skipna=True)
+            grp[f"delta_vs_route_all_history_{metric}"] = grp[metric] - grp[f"route_all_history_avg_{metric}"]
+            denom = grp[f"route_all_history_avg_{metric}"].replace(0, np.nan)
+            grp[f"pct_vs_route_all_history_{metric}"] = (grp[f"delta_vs_route_all_history_{metric}"] / denom) * 100.0
+
+            prev7 = grp[metric].shift(1).rolling(window=7, min_periods=1).mean()
+            grp[f"route_prev_7_obs_avg_{metric}"] = prev7
+            grp[f"route_prev_7_obs_count_{metric}"] = grp[metric].shift(1).rolling(window=7, min_periods=1).count()
+            grp[f"delta_vs_route_prev_7_obs_{metric}"] = grp[metric] - grp[f"route_prev_7_obs_avg_{metric}"]
+            denom7 = grp[f"route_prev_7_obs_avg_{metric}"].replace(0, np.nan)
+            grp[f"pct_vs_route_prev_7_obs_{metric}"] = (grp[f"delta_vs_route_prev_7_obs_{metric}"] / denom7) * 100.0
+
+        # Same-weekday benchmark uses prior observations on the same route and weekday
+        for metric in metric_cols:
+            same_weekday_avgs = []
+            same_weekday_counts = []
+            values = grp[metric].tolist()
+            weekdays = grp["weekday"].tolist()
+            for i, wd in enumerate(weekdays):
+                prior_vals = [values[j] for j in range(i) if weekdays[j] == wd and pd.notna(values[j])]
+                same_weekday_counts.append(len(prior_vals))
+                same_weekday_avgs.append(float(np.mean(prior_vals)) if prior_vals else np.nan)
+            grp[f"route_same_weekday_avg_{metric}"] = same_weekday_avgs
+            grp[f"route_same_weekday_count_{metric}"] = same_weekday_counts
+            grp[f"delta_vs_route_same_weekday_{metric}"] = grp[metric] - grp[f"route_same_weekday_avg_{metric}"]
+            denom_sw = grp[f"route_same_weekday_avg_{metric}"].replace(0, np.nan)
+            grp[f"pct_vs_route_same_weekday_{metric}"] = (grp[f"delta_vs_route_same_weekday_{metric}"] / denom_sw) * 100.0
+
+        route_groups.append(grp)
+
+    out = pd.concat(route_groups, ignore_index=True) if route_groups else df
+    return out.sort_values([c for c in ["scan_date", "route", "courier_name", "fedex_id"] if c in out.columns]).reset_index(drop=True)

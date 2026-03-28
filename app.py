@@ -86,6 +86,16 @@ def _route_filter(df: pd.DataFrame, route_col: str, selected_routes) -> pd.DataF
     return df[df[route_col].astype(str).isin([str(x) for x in selected_routes])].copy()
 
 
+def _round_numeric(df: pd.DataFrame, decimals: int = 1) -> pd.DataFrame:
+    if df is None:
+        return df
+    out = df.copy()
+    num_cols = out.select_dtypes(include=["number"]).columns
+    if len(num_cols) > 0:
+        out[num_cols] = out[num_cols].round(decimals)
+    return out
+
+
 def _detect_file_type(file_obj) -> str:
     name = getattr(file_obj, "name", "").lower()
 
@@ -394,13 +404,17 @@ elif page == "Analyze Existing Master":
                 route_values.extend(pd.Series(df[col]).dropna().astype(str).tolist())
         route_options = sorted({int(float(r)) for r in route_values if str(r).strip() not in {"", "nan"}})
 
-        courier_options = []
-        if not gap_route_metrics_master.empty and "courier_name" in gap_route_metrics_master.columns:
-            courier_options = sorted([c for c in gap_route_metrics_master["courier_name"].dropna().astype(str).unique().tolist() if c.strip()])
-
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         with c1:
             selected_routes = st.multiselect("Filter routes", options=route_options, default=[])
+
+        courier_options = []
+        if not gap_route_metrics_master.empty and "courier_name" in gap_route_metrics_master.columns:
+            courier_source = gap_route_metrics_master.copy()
+            if selected_routes:
+                courier_source = _route_filter(courier_source, "route", selected_routes)
+            courier_options = sorted([c for c in courier_source["courier_name"].dropna().astype(str).unique().tolist() if c.strip()])
+
         with c2:
             all_dates = []
             for df, col in [
@@ -420,14 +434,6 @@ elif page == "Analyze Existing Master":
                 date_range = None
         with c3:
             selected_couriers = st.multiselect("Filter couriers", options=courier_options, default=[])
-        with c4:
-            tolerance = st.number_input(
-                "Pickup/GAP match tolerance (min)",
-                min_value=1,
-                max_value=30,
-                value=APP_CONFIG["pickup_match_tolerance_min"],
-                step=1,
-            )
 
         run_analysis = st.button("Run Analysis")
 
@@ -454,7 +460,7 @@ elif page == "Analyze Existing Master":
 
             with st.spinner("Building summaries..."):
                 route_day_summary = build_route_day_summary(gap_f, pickup_stops_f)
-                best_matches, match_report = match_pickups_to_gap(gap_f, pickup_stops_f, tolerance_min=tolerance)
+                best_matches, match_report = match_pickups_to_gap(gap_f, pickup_stops_f, tolerance_min=APP_CONFIG["pickup_match_tolerance_min"])
                 stop_detail_xref = cross_reference_stop_detail(stop_detail_f, gap_f, pickup_master) if not stop_detail_f.empty else pd.DataFrame()
                 metrics_history = gap_route_metrics_master.copy()
                 gap_history = gap_master.copy()
@@ -476,17 +482,18 @@ elif page == "Analyze Existing Master":
                     "source_file",
                 ]
                 show_cols = [c for c in show_cols if c in metrics_f.columns]
-                st.dataframe(metrics_f.sort_values(["scan_date", "route", "courier_name"])[show_cols], use_container_width=True)
+                metrics_display = _round_numeric(metrics_f.sort_values(["scan_date", "route", "courier_name"])[show_cols], 1)
+                st.dataframe(metrics_display, use_container_width=True)
 
                 k1, k2, k3, k4 = st.columns(4)
                 with k1:
                     st.metric("Courier-day rows", len(metrics_f))
                 with k2:
-                    st.metric("Avg ST/H OA", round(float(metrics_f["actual_sth_oa"].dropna().mean()), 2) if metrics_f["actual_sth_oa"].notna().any() else "—")
+                    st.metric("Avg ST/H OA", round(float(metrics_f["actual_sth_oa"].dropna().mean()), 1) if metrics_f["actual_sth_oa"].notna().any() else "—")
                 with k3:
-                    st.metric("Avg ST/H OR", round(float(metrics_f["actual_sth_or"].dropna().mean()), 2) if metrics_f["actual_sth_or"].notna().any() else "—")
+                    st.metric("Avg ST/H OR", round(float(metrics_f["actual_sth_or"].dropna().mean()), 1) if metrics_f["actual_sth_or"].notna().any() else "—")
                 with k4:
-                    st.metric("Avg GAP sum/day", round(float(metrics_f["gap_sum_minutes_all"].dropna().mean()), 1) if "gap_sum_minutes_all" in metrics_f.columns and metrics_f["gap_sum_minutes_all"].notna().any() else "—")
+                    st.metric("Large gap exceptions", int(len(large_gap_exceptions)))
 
             st.subheader("Route performance benchmarks")
             if route_performance_benchmarks.empty:
@@ -504,10 +511,11 @@ elif page == "Analyze Existing Master":
                     "delta_vs_same_weekday_oa", "delta_vs_same_weekday_or",
                 ]
                 bench_cols = [c for c in bench_cols if c in route_performance_benchmarks.columns]
-                st.dataframe(route_performance_benchmarks[bench_cols], use_container_width=True)
+                route_bench_display = _round_numeric(route_performance_benchmarks[bench_cols], 1)
+                st.dataframe(route_bench_display, use_container_width=True)
                 st.download_button(
                     "Download route_performance_benchmarks.csv",
-                    data=_csv_bytes(route_performance_benchmarks),
+                    data=_csv_bytes(_round_numeric(route_performance_benchmarks, 1)),
                     file_name="route_performance_benchmarks.csv",
                     mime="text/csv",
                 )
@@ -522,10 +530,11 @@ elif page == "Analyze Existing Master":
                     "severity_ratio", "severity_band",
                 ]
                 gap_cols = [c for c in gap_cols if c in large_gap_exceptions.columns]
-                st.dataframe(large_gap_exceptions[gap_cols], use_container_width=True)
+                large_gap_display = _round_numeric(large_gap_exceptions[gap_cols], 1)
+                st.dataframe(large_gap_display, use_container_width=True)
                 st.download_button(
                     "Download large_gap_exceptions.csv",
-                    data=_csv_bytes(large_gap_exceptions),
+                    data=_csv_bytes(_round_numeric(large_gap_exceptions, 1)),
                     file_name="large_gap_exceptions.csv",
                     mime="text/csv",
                 )
@@ -534,19 +543,20 @@ elif page == "Analyze Existing Master":
             if route_day_summary.empty:
                 st.info("No route-day summary available for the current filters.")
             else:
-                st.dataframe(route_day_summary, use_container_width=True)
-                st.download_button("Download route_day_summary.csv", data=_csv_bytes(route_day_summary), file_name="route_day_summary.csv", mime="text/csv")
+                route_day_display = _round_numeric(route_day_summary, 1)
+                st.dataframe(route_day_display, use_container_width=True)
+                st.download_button("Download route_day_summary.csv", data=_csv_bytes(route_day_display), file_name="route_day_summary.csv", mime="text/csv")
 
             st.subheader("Pickup ↔ GAP match report")
             if match_report.empty:
                 st.info("No pickup/GAP matches available for the current filters.")
             else:
-                st.dataframe(match_report, use_container_width=True)
+                st.dataframe(_round_numeric(match_report, 1), use_container_width=True)
 
             if not best_matches.empty:
                 st.subheader("Best matches")
-                st.dataframe(best_matches.head(200), use_container_width=True)
-                st.download_button("Download best_matches.csv", data=_csv_bytes(best_matches), file_name="best_matches.csv", mime="text/csv")
+                st.dataframe(_round_numeric(best_matches.head(200), 1), use_container_width=True)
+                st.download_button("Download best_matches.csv", data=_csv_bytes(_round_numeric(best_matches, 1)), file_name="best_matches.csv", mime="text/csv")
 
             if not stop_detail_f.empty:
                 st.subheader("Stop-detail family summary")
@@ -562,13 +572,13 @@ elif page == "Analyze Existing Master":
                     .reset_index()
                     .sort_values(["scan_date", "route_key", "stop_family"])
                 )
-                st.dataframe(family_summary, use_container_width=True)
+                st.dataframe(_round_numeric(family_summary, 1), use_container_width=True)
 
                 st.subheader("Stop-detail cross-reference")
-                st.dataframe(stop_detail_xref.head(200), use_container_width=True)
+                st.dataframe(_round_numeric(stop_detail_xref.head(200), 1), use_container_width=True)
                 st.download_button(
                     "Download stop_detail_cross_reference.csv",
-                    data=_csv_bytes(stop_detail_xref),
+                    data=_csv_bytes(_round_numeric(stop_detail_xref, 1)),
                     file_name="stop_detail_cross_reference.csv",
                     mime="text/csv",
                 )

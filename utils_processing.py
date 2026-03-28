@@ -1222,62 +1222,90 @@ def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=Non
 
 
 
-def build_large_gap_exceptions(gap_df, floor_minutes=10.0, exclude_first_stop_gap=True):
+def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
     """Customer-stop-only large gaps. Optionally excludes the first customer stop of the day/route,
-    since that GAP usually represents leave-building to first-stop stem time rather than on-area pacing."""
+    since that GAP usually represents leave-building to first-stop stem time rather than on-area pacing.
+
+    Parameters
+    ----------
+    gap_df : DataFrame
+        Filtered/current gap stop rows to evaluate for exceptions.
+    gap_history : DataFrame, optional
+        Broader route history used to calculate route-aware thresholds. If omitted or empty,
+        thresholds are calculated from ``gap_df`` itself.
+    floor_minutes : float, default 10.0
+        Absolute minimum threshold floor.
+    exclude_first_stop_gap : bool, default True
+        Exclude first customer stop per courier-route-day from exception logic.
+    """
     if gap_df is None or gap_df.empty:
         return pd.DataFrame()
 
-    g = gap_df.copy()
-    g["scan_date"] = pd.to_datetime(g.get("scan_date"), errors="coerce").dt.normalize()
-    if "route" in g.columns:
-        g["route"] = pd.to_numeric(g["route"], errors="coerce").astype("Int64")
-    if "stop_order" in g.columns:
-        g["stop_order"] = pd.to_numeric(g["stop_order"], errors="coerce")
-    if "gap_minutes" in g.columns:
-        g["gap_minutes"] = pd.to_numeric(g["gap_minutes"], errors="coerce")
-    if "fedex_id" in g.columns:
-        g["fedex_id"] = g["fedex_id"].astype(str)
+    def _prep_gap_frame(df):
+        x = df.copy()
+        x["scan_date"] = pd.to_datetime(x.get("scan_date"), errors="coerce").dt.normalize()
+        if "route" in x.columns:
+            x["route"] = pd.to_numeric(x["route"], errors="coerce").astype("Int64")
+        if "stop_order" in x.columns:
+            x["stop_order"] = pd.to_numeric(x["stop_order"], errors="coerce")
+        if "gap_minutes" in x.columns:
+            x["gap_minutes"] = pd.to_numeric(x["gap_minutes"], errors="coerce")
+        if "fedex_id" in x.columns:
+            x["fedex_id"] = x["fedex_id"].astype(str)
 
-    if "is_event_row" not in g.columns:
-        g["is_event_row"] = g.get("address", pd.Series("", index=g.index)).astype(str).str.startswith("*")
-    if "is_pickup_like" not in g.columns:
-        stop_type_upper = g.get("stop_type", pd.Series("", index=g.index)).astype(str).str.upper()
-        g["is_pickup_like"] = stop_type_upper.str.contains("PU", na=False)
-    if "is_delivery_like" not in g.columns:
-        stop_type_upper = g.get("stop_type", pd.Series("", index=g.index)).astype(str).str.upper()
-        g["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
+        if "is_event_row" not in x.columns:
+            x["is_event_row"] = x.get("address", pd.Series("", index=x.index)).astype(str).str.startswith("*")
+        stop_type_upper = x.get("stop_type", pd.Series("", index=x.index)).astype(str).str.upper()
+        if "is_pickup_like" not in x.columns:
+            x["is_pickup_like"] = stop_type_upper.str.contains("PU", na=False)
+        if "is_delivery_like" not in x.columns:
+            x["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
 
-    # Customer stops only.
-    g = g[(~g["is_event_row"].fillna(False)) & (g["gap_minutes"].notna())].copy()
+        x = x[(~x["is_event_row"].fillna(False)) & (x["gap_minutes"].notna())].copy()
+        if x.empty:
+            return x
+
+        x["is_customer_stop"] = True
+        group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in x.columns]
+        if exclude_first_stop_gap and group_cols:
+            sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in x.columns]
+            x = x.sort_values(sort_cols)
+            first_idx = x.groupby(group_cols, dropna=False).head(1).index
+            x["is_first_customer_stop"] = False
+            x.loc[first_idx, "is_first_customer_stop"] = True
+        else:
+            x["is_first_customer_stop"] = False
+        return x
+
+    g = _prep_gap_frame(gap_df)
     if g.empty:
         return pd.DataFrame()
-
-    g["is_customer_stop"] = True
-
-    # Identify first customer stop per courier-route-day and exclude from exception logic.
-    group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in g.columns]
-    if exclude_first_stop_gap and group_cols:
-        sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in g.columns]
-        g = g.sort_values(sort_cols)
-        first_idx = g.groupby(group_cols, dropna=False).head(1).index
-        g["is_first_customer_stop"] = False
-        g.loc[first_idx, "is_first_customer_stop"] = True
-    else:
-        g["is_first_customer_stop"] = False
 
     base = g[~g["is_first_customer_stop"]].copy() if exclude_first_stop_gap else g.copy()
     if base.empty:
         return pd.DataFrame()
 
+    history_source = gap_history if gap_history is not None and not getattr(gap_history, "empty", True) else gap_df
+    h = _prep_gap_frame(history_source)
+    history_base = h[~h["is_first_customer_stop"]].copy() if (exclude_first_stop_gap and not h.empty) else h.copy()
+    if history_base.empty:
+        history_base = base.copy()
+
     route_stats = (
-        base.groupby("route", dropna=False)["gap_minutes"]
+        history_base.groupby("route", dropna=False)["gap_minutes"]
         .agg(route_gap_median="median", route_gap_p90=lambda s: float(s.quantile(0.90)))
         .reset_index()
     )
-    route_stats["route_gap_threshold"] = route_stats[["route_gap_p90", "route_gap_median"]].max(axis=1)
+    if route_stats.empty:
+        return pd.DataFrame()
+
     route_stats["route_gap_threshold"] = route_stats.apply(
-        lambda r: max(float(r["route_gap_p90"]), float(r["route_gap_median"]) * 2.0, float(floor_minutes)), axis=1
+        lambda r: max(
+            float(r["route_gap_p90"]) if pd.notna(r["route_gap_p90"]) else float("-inf"),
+            (float(r["route_gap_median"]) * 2.0) if pd.notna(r["route_gap_median"]) else float("-inf"),
+            float(floor_minutes),
+        ),
+        axis=1,
     )
 
     out = base.merge(route_stats, on="route", how="left")
@@ -1296,7 +1324,10 @@ def build_large_gap_exceptions(gap_df, floor_minutes=10.0, exclude_first_stop_ga
         "Pickup stop gap needs review",
         "Customer stop gap needs review",
     )
-    out = out.sort_values([c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns], ascending=[True, True, False])
+    out = out.sort_values(
+        [c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns],
+        ascending=[True, True, False],
+    )
     cols = [
         "scan_date", "route", "fedex_id", "stop_order", "stop_type", "address", "activity_dt",
         "gap_minutes", "route_gap_median", "route_gap_p90", "route_gap_threshold",
@@ -1304,3 +1335,4 @@ def build_large_gap_exceptions(gap_df, floor_minutes=10.0, exclude_first_stop_ga
     ]
     cols = [c for c in cols if c in out.columns]
     return out[cols].reset_index(drop=True)
+

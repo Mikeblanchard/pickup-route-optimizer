@@ -1168,7 +1168,7 @@ def build_courier_day_changes(gap_route_metrics_df):
 
 
 
-def build_route_performance_benchmarks(gap_route_metrics_df):
+def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=None):
     """One row per route-day with route-level benchmark columns."""
     if gap_route_metrics_df is None or gap_route_metrics_df.empty:
         return pd.DataFrame()

@@ -1223,10 +1223,11 @@ def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=Non
 
 
 def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
-    """Customer-stop-only large gaps with leg context.
+    """Customer-stop-only large gaps with before/after leg context.
 
-    The flagged row is the *current* stop where the long gap ended, but the output
-    also includes the previous stop/time/address so the exception reads as a leg.
+    The flagged row is the current customer stop where the long gap ended, but the
+    output also includes the previous stop so the result reads like a movement leg:
+    before_address -> after_address, before_time -> after_time.
     """
     if gap_df is None or gap_df.empty:
         return pd.DataFrame()
@@ -1257,12 +1258,12 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
         if x.empty:
             return x
 
-        x["is_customer_stop"] = True
         group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in x.columns]
         sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in x.columns]
         if sort_cols:
             x = x.sort_values(sort_cols).copy()
 
+        x["is_customer_stop"] = True
         if exclude_first_stop_gap and group_cols:
             first_idx = x.groupby(group_cols, dropna=False).head(1).index
             x["is_first_customer_stop"] = False
@@ -1282,12 +1283,14 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
             x["prev_address"] = None
             x["prev_activity_dt"] = pd.NaT
 
-        current_address = x.get("address", pd.Series("", index=x.index)).fillna("(unknown)").astype(str).str.strip()
-        prev_address = x["prev_address"].fillna("(start)").astype(str).str.strip()
-        x["gap_from_to"] = prev_address + " -> " + current_address
+        x["before_address"] = x["prev_address"].fillna("(start)").astype(str).str.strip()
+        x["after_address"] = x.get("address", pd.Series("", index=x.index)).fillna("(unknown)").astype(str).str.strip()
+        x["before_time"] = np.where(x["prev_activity_dt"].notna(), x["prev_activity_dt"].dt.strftime("%H:%M"), None)
+        x["after_time"] = np.where(x["activity_dt"].notna(), x["activity_dt"].dt.strftime("%H:%M"), None)
+        x["gap_from_to"] = x["before_address"] + " -> " + x["after_address"]
         x["gap_time_window"] = np.where(
-            x["prev_activity_dt"].notna() & x["activity_dt"].notna(),
-            x["prev_activity_dt"].dt.strftime("%H:%M") + " -> " + x["activity_dt"].dt.strftime("%H:%M"),
+            pd.Series(x["before_time"], index=x.index).notna() & pd.Series(x["after_time"], index=x.index).notna(),
+            pd.Series(x["before_time"], index=x.index).astype(str) + " -> " + pd.Series(x["after_time"], index=x.index).astype(str),
             None,
         )
         return x
@@ -1327,6 +1330,51 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
     out = out[out["gap_minutes"] >= out["route_gap_threshold"]].copy()
     if out.empty:
         return out
+
+    out["severity_ratio"] = out["gap_minutes"] / out["route_gap_threshold"]
+    out["severity_band"] = np.select(
+        [out["severity_ratio"] >= 2.0, out["severity_ratio"] >= 1.5, out["severity_ratio"] >= 1.2],
+        ["High", "Medium", "Watch"],
+        default="Watch",
+    )
+    out["explanation_note"] = np.where(
+        out.get("is_pickup_like", False),
+        "Pickup stop gap needs review",
+        "Customer stop gap needs review",
+    )
+
+    preferred_cols = [
+        "scan_date",
+        "route",
+        "fedex_id",
+        "courier_name",
+        "prev_stop_order",
+        "stop_order",
+        "prev_stop_type",
+        "stop_type",
+        "before_address",
+        "after_address",
+        "before_time",
+        "after_time",
+        "gap_minutes",
+        "route_gap_median",
+        "route_gap_p90",
+        "route_gap_threshold",
+        "severity_ratio",
+        "severity_band",
+        "gap_from_to",
+        "gap_time_window",
+        "explanation_note",
+    ]
+    existing_preferred = [c for c in preferred_cols if c in out.columns]
+    remaining = [c for c in out.columns if c not in existing_preferred]
+    out = out[existing_preferred + remaining]
+
+    out = out.sort_values(
+        [c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns],
+        ascending=[True, True, False],
+    )
+    return out
 
     out["severity_ratio"] = out["gap_minutes"] / out["route_gap_threshold"]
     out["severity_band"] = np.select(

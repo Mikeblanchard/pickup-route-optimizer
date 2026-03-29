@@ -1326,3 +1326,191 @@ def build_courier_day_changes(gap_route_metrics_df):
             df[f"prev_{c}"] = group[c].shift(1)
             df[f"delta_{c}"] = df[c] - df[f"prev_{c}"]
     return df
+
+
+
+def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=None):
+    """Build one row per route-day with route-level benchmarks and deltas.
+    Uses full metrics_history when provided; otherwise falls back to the filtered frame.
+    """
+    if gap_route_metrics_df is None or len(gap_route_metrics_df) == 0:
+        return pd.DataFrame()
+
+    df = gap_route_metrics_df.copy()
+    history = metrics_history.copy() if metrics_history is not None and len(metrics_history) else df.copy()
+
+    for x in (df, history):
+        if 'scan_date' in x.columns:
+            x['scan_date'] = pd.to_datetime(x['scan_date'], errors='coerce')
+        if 'route' in x.columns:
+            x['route'] = x['route'].astype(str).str.strip()
+
+    for col in ['actual_sth_oa','actual_sth_or','gap_sum_minutes_all','gap_sum_minutes_customer','total_stops_actual']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        if col in history.columns:
+            history[col] = pd.to_numeric(history[col], errors='coerce')
+
+    if 'weekday' not in df.columns:
+        df['weekday'] = df['scan_date'].dt.day_name()
+    if 'weekday' not in history.columns:
+        history['weekday'] = history['scan_date'].dt.day_name()
+
+    overall_avg_sth_oa = history['actual_sth_oa'].dropna().mean() if 'actual_sth_oa' in history.columns else np.nan
+    overall_avg_sth_or = history['actual_sth_or'].dropna().mean() if 'actual_sth_or' in history.columns else np.nan
+
+    if 'route' in history.columns:
+        route_hist = history.groupby('route', dropna=False).agg(
+            route_all_history_avg_sth_oa=('actual_sth_oa','mean'),
+            route_all_history_avg_sth_or=('actual_sth_or','mean'),
+        ).reset_index()
+        df = df.merge(route_hist, on='route', how='left')
+    else:
+        df['route_all_history_avg_sth_oa'] = np.nan
+        df['route_all_history_avg_sth_or'] = np.nan
+
+    if {'route','weekday'}.issubset(history.columns):
+        same_wd = history.groupby(['route','weekday'], dropna=False).agg(
+            route_same_weekday_avg_sth_oa=('actual_sth_oa','mean'),
+            route_same_weekday_avg_sth_or=('actual_sth_or','mean'),
+        ).reset_index()
+        df = df.merge(same_wd, on=['route','weekday'], how='left')
+    else:
+        df['route_same_weekday_avg_sth_oa'] = np.nan
+        df['route_same_weekday_avg_sth_or'] = np.nan
+
+    # previous 7 route observations, excluding current row by date match
+    df = df.sort_values(['route','scan_date']).reset_index(drop=True)
+    history = history.sort_values(['route','scan_date']).reset_index(drop=True)
+    prev7_oa = []
+    prev7_or = []
+    for _, row in df.iterrows():
+        route = row.get('route')
+        date = row.get('scan_date')
+        hist = history[history['route'].astype(str).str.strip() == str(route).strip()].copy()
+        if pd.notna(date):
+            hist = hist[hist['scan_date'] < date]
+        hist = hist.tail(7)
+        prev7_oa.append(hist['actual_sth_oa'].dropna().mean() if 'actual_sth_oa' in hist.columns and len(hist) else np.nan)
+        prev7_or.append(hist['actual_sth_or'].dropna().mean() if 'actual_sth_or' in hist.columns and len(hist) else np.nan)
+    df['route_prev_7_obs_avg_sth_oa'] = prev7_oa
+    df['route_prev_7_obs_avg_sth_or'] = prev7_or
+
+    df['overall_avg_sth_oa'] = overall_avg_sth_oa
+    df['overall_avg_sth_or'] = overall_avg_sth_or
+
+    for actual, bench, out in [
+        ('actual_sth_oa','route_all_history_avg_sth_oa','delta_vs_route_all_history_oa'),
+        ('actual_sth_or','route_all_history_avg_sth_or','delta_vs_route_all_history_or'),
+        ('actual_sth_oa','route_prev_7_obs_avg_sth_oa','delta_vs_prev_7_obs_oa'),
+        ('actual_sth_or','route_prev_7_obs_avg_sth_or','delta_vs_prev_7_obs_or'),
+        ('actual_sth_oa','route_same_weekday_avg_sth_oa','delta_vs_same_weekday_oa'),
+        ('actual_sth_or','route_same_weekday_avg_sth_or','delta_vs_same_weekday_or'),
+    ]:
+        if actual in df.columns and bench in df.columns:
+            df[out] = pd.to_numeric(df[actual], errors='coerce') - pd.to_numeric(df[bench], errors='coerce')
+            pct = out.replace('delta_','pct_')
+            denom = pd.to_numeric(df[bench], errors='coerce').replace(0, np.nan)
+            df[pct] = (df[out] / denom) * 100.0
+
+    return df
+
+
+def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
+    """Customer-stop-only large gaps with previous/current stop context.
+    Uses gap_history for route thresholds when provided.
+    """
+    if gap_df is None or len(gap_df) == 0:
+        return pd.DataFrame()
+
+    df = gap_df.copy()
+    history_source = gap_history.copy() if gap_history is not None and len(gap_history) else df.copy()
+
+    for x in (df, history_source):
+        if 'scan_date' in x.columns:
+            x['scan_date'] = pd.to_datetime(x['scan_date'], errors='coerce')
+        if 'activity_dt' in x.columns:
+            x['activity_dt'] = pd.to_datetime(x['activity_dt'], errors='coerce')
+        if 'gap_minutes' in x.columns:
+            x['gap_minutes'] = pd.to_numeric(x['gap_minutes'], errors='coerce')
+        if 'stop_order' in x.columns:
+            x['stop_order'] = pd.to_numeric(x['stop_order'], errors='coerce')
+        if 'route' in x.columns:
+            x['route'] = x['route'].astype(str).str.strip()
+
+    # customer stops only, exclude event rows
+    def _customer_only(x):
+        if 'is_event_row' in x.columns:
+            x = x[~x['is_event_row'].fillna(False)].copy()
+        if 'stop_order' in x.columns:
+            x = x[x['stop_order'].notna()].copy()
+        return x
+
+    df = _customer_only(df)
+    history_source = _customer_only(history_source)
+    if df.empty:
+        return pd.DataFrame()
+
+    # optional: exclude first customer stop from exception logic
+    df = df.sort_values([c for c in ['scan_date','route','fedex_id','activity_dt','stop_order'] if c in df.columns]).copy()
+    grp_cols = [c for c in ['scan_date','route','fedex_id'] if c in df.columns]
+    if exclude_first_stop_gap and grp_cols:
+        df['_rownum_in_day'] = df.groupby(grp_cols, dropna=False).cumcount() + 1
+        df = df[df['_rownum_in_day'] > 1].copy()
+
+    # previous stop context from filtered customer-stop series
+    base = _customer_only(gap_df.copy())
+    for col in ['scan_date','activity_dt']:
+        if col in base.columns:
+            base[col] = pd.to_datetime(base[col], errors='coerce')
+    if 'stop_order' in base.columns:
+        base['stop_order'] = pd.to_numeric(base['stop_order'], errors='coerce')
+    if 'route' in base.columns:
+        base['route'] = base['route'].astype(str).str.strip()
+    base = base.sort_values([c for c in ['scan_date','route','fedex_id','activity_dt','stop_order'] if c in base.columns]).copy()
+    base_grp = [c for c in ['scan_date','route','fedex_id'] if c in base.columns]
+    if base_grp:
+        base['prev_stop_order'] = base.groupby(base_grp, dropna=False)['stop_order'].shift(1)
+        base['prev_stop_type'] = base.groupby(base_grp, dropna=False)['stop_type'].shift(1)
+        base['prev_address'] = base.groupby(base_grp, dropna=False)['address'].shift(1)
+        base['prev_activity_dt'] = base.groupby(base_grp, dropna=False)['activity_dt'].shift(1)
+
+    merge_keys = [c for c in ['scan_date','route','fedex_id','stop_order'] if c in df.columns and c in base.columns]
+    if merge_keys:
+        df = df.merge(base[merge_keys + [c for c in ['prev_stop_order','prev_stop_type','prev_address','prev_activity_dt'] if c in base.columns]], on=merge_keys, how='left')
+
+    # route thresholds from history
+    if history_source.empty or 'gap_minutes' not in history_source.columns:
+        return pd.DataFrame()
+    route_stats = history_source.groupby('route', dropna=False)['gap_minutes'].agg(
+        route_gap_median='median',
+        route_gap_p90=lambda s: s.quantile(0.90)
+    ).reset_index()
+    route_stats['route_gap_threshold'] = route_stats.apply(
+        lambda r: max(float(r['route_gap_p90']) if pd.notna(r['route_gap_p90']) else 0.0,
+                      float(r['route_gap_median']) * 2.0 if pd.notna(r['route_gap_median']) else 0.0,
+                      float(floor_minutes)), axis=1)
+    df = df.merge(route_stats, on='route', how='left')
+    df = df[pd.to_numeric(df['gap_minutes'], errors='coerce') >= pd.to_numeric(df['route_gap_threshold'], errors='coerce')].copy()
+    if df.empty:
+        return df
+
+    df['severity_ratio'] = pd.to_numeric(df['gap_minutes'], errors='coerce') / pd.to_numeric(df['route_gap_threshold'], errors='coerce').replace(0, np.nan)
+    df['severity_band'] = np.select(
+        [df['severity_ratio'] >= 2.0, df['severity_ratio'] >= 1.5, df['severity_ratio'] >= 1.0],
+        ['High','Medium','Watch'],
+        default='Watch'
+    )
+    if 'prev_address' in df.columns and 'address' in df.columns:
+        df['before_address'] = df['prev_address']
+        df['after_address'] = df['address']
+        df['gap_from_to'] = df['before_address'].fillna('') + ' -> ' + df['after_address'].fillna('')
+    if 'prev_activity_dt' in df.columns:
+        df['before_time'] = pd.to_datetime(df['prev_activity_dt'], errors='coerce').dt.strftime('%H:%M')
+    if 'activity_dt' in df.columns:
+        df['after_time'] = pd.to_datetime(df['activity_dt'], errors='coerce').dt.strftime('%H:%M')
+    if 'before_time' in df.columns and 'after_time' in df.columns:
+        df['gap_time_window'] = df['before_time'].fillna('') + ' -> ' + df['after_time'].fillna('')
+    if 'scan_date' in df.columns:
+        df['scan_date'] = pd.to_datetime(df['scan_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+    return df.sort_values(['severity_ratio','gap_minutes'], ascending=[False,False]).reset_index(drop=True)

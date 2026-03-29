@@ -1223,20 +1223,10 @@ def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=Non
 
 
 def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
-    """Customer-stop-only large gaps. Optionally excludes the first customer stop of the day/route,
-    since that GAP usually represents leave-building to first-stop stem time rather than on-area pacing.
+    """Customer-stop-only large gaps with leg context.
 
-    Parameters
-    ----------
-    gap_df : DataFrame
-        Filtered/current gap stop rows to evaluate for exceptions.
-    gap_history : DataFrame, optional
-        Broader route history used to calculate route-aware thresholds. If omitted or empty,
-        thresholds are calculated from ``gap_df`` itself.
-    floor_minutes : float, default 10.0
-        Absolute minimum threshold floor.
-    exclude_first_stop_gap : bool, default True
-        Exclude first customer stop per courier-route-day from exception logic.
+    The flagged row is the *current* stop where the long gap ended, but the output
+    also includes the previous stop/time/address so the exception reads as a leg.
     """
     if gap_df is None or gap_df.empty:
         return pd.DataFrame()
@@ -1252,6 +1242,8 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
             x["gap_minutes"] = pd.to_numeric(x["gap_minutes"], errors="coerce")
         if "fedex_id" in x.columns:
             x["fedex_id"] = x["fedex_id"].astype(str)
+        if "activity_dt" in x.columns:
+            x["activity_dt"] = pd.to_datetime(x["activity_dt"], errors="coerce")
 
         if "is_event_row" not in x.columns:
             x["is_event_row"] = x.get("address", pd.Series("", index=x.index)).astype(str).str.startswith("*")
@@ -1267,14 +1259,37 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
 
         x["is_customer_stop"] = True
         group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in x.columns]
+        sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in x.columns]
+        if sort_cols:
+            x = x.sort_values(sort_cols).copy()
+
         if exclude_first_stop_gap and group_cols:
-            sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in x.columns]
-            x = x.sort_values(sort_cols)
             first_idx = x.groupby(group_cols, dropna=False).head(1).index
             x["is_first_customer_stop"] = False
             x.loc[first_idx, "is_first_customer_stop"] = True
         else:
             x["is_first_customer_stop"] = False
+
+        if group_cols:
+            grp = x.groupby(group_cols, dropna=False)
+            x["prev_stop_order"] = grp["stop_order"].shift(1) if "stop_order" in x.columns else np.nan
+            x["prev_stop_type"] = grp["stop_type"].shift(1) if "stop_type" in x.columns else None
+            x["prev_address"] = grp["address"].shift(1) if "address" in x.columns else None
+            x["prev_activity_dt"] = grp["activity_dt"].shift(1) if "activity_dt" in x.columns else pd.NaT
+        else:
+            x["prev_stop_order"] = np.nan
+            x["prev_stop_type"] = None
+            x["prev_address"] = None
+            x["prev_activity_dt"] = pd.NaT
+
+        current_address = x.get("address", pd.Series("", index=x.index)).fillna("(unknown)").astype(str).str.strip()
+        prev_address = x["prev_address"].fillna("(start)").astype(str).str.strip()
+        x["gap_from_to"] = prev_address + " -> " + current_address
+        x["gap_time_window"] = np.where(
+            x["prev_activity_dt"].notna() & x["activity_dt"].notna(),
+            x["prev_activity_dt"].dt.strftime("%H:%M") + " -> " + x["activity_dt"].dt.strftime("%H:%M"),
+            None,
+        )
         return x
 
     g = _prep_gap_frame(gap_df)
@@ -1329,10 +1344,12 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exc
         ascending=[True, True, False],
     )
     cols = [
-        "scan_date", "route", "fedex_id", "stop_order", "stop_type", "address", "activity_dt",
+        "scan_date", "route", "fedex_id",
+        "prev_stop_order", "prev_stop_type", "prev_address", "prev_activity_dt",
+        "stop_order", "stop_type", "address", "activity_dt",
+        "gap_from_to", "gap_time_window",
         "gap_minutes", "route_gap_median", "route_gap_p90", "route_gap_threshold",
-        "severity_ratio", "severity_band", "is_first_customer_stop", "explanation_note",
+        "severity_ratio", "severity_band", "explanation_note",
     ]
     cols = [c for c in cols if c in out.columns]
     return out[cols].reset_index(drop=True)
-

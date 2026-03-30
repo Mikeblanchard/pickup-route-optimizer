@@ -12,8 +12,6 @@ from utils_processing import (
     build_courier_day_changes,
     build_ingestion_log_entries,
     build_route_day_summary,
-    build_courier_day_changes,
-    build_pickup_work_group_summary,
     consolidate_physical_pickups,
     cross_reference_stop_detail,
     ensure_data_dirs,
@@ -27,6 +25,7 @@ from utils_processing import (
     read_stop_detail_file,
     read_uploaded_excels,
     save_master_tables,
+    save_uploaded_source_files,
     standardize_gap,
     standardize_gap_html_stops,
     standardize_gap_route_metrics,
@@ -117,21 +116,25 @@ def _detect_file_type(file_obj) -> str:
     except Exception:
         pass
 
-    try:
-        file_obj.seek(0)
-        preview_df = pd.read_excel(file_obj, nrows=5)
-        cols = set(preview_df.columns.astype(str))
-        if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
+    for reader in ("excel", "csv"):
+        try:
             file_obj.seek(0)
-            return "gap_excel"
-        if {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
-            file_obj.seek(0)
-            return "pickup"
-        if {"Date", "Route", "Stop Order", "Stop Type"}.issubset(cols) and {"Activity Time", "Ready Time", "Close Time"}.intersection(cols):
-            file_obj.seek(0)
-            return "stop_detail"
-    except Exception:
-        pass
+            if reader == "excel":
+                preview_df = pd.read_excel(file_obj, nrows=5)
+            else:
+                preview_df = pd.read_csv(file_obj, nrows=5)
+            cols = set(preview_df.columns.astype(str))
+            if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
+                file_obj.seek(0)
+                return "gap_excel"
+            if {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
+                file_obj.seek(0)
+                return "pickup"
+            if {"Date", "Route", "Stop Order", "Stop Type"}.issubset(cols) and {"Activity Time", "Ready Time", "Close Time"}.intersection(cols):
+                file_obj.seek(0)
+                return "stop_detail"
+        except Exception:
+            pass
 
     try:
         file_obj.seek(0)
@@ -169,10 +172,9 @@ if page == "Update Master Data":
 
     with st.form("update_form", clear_on_submit=False):
         st.subheader("Upload new source files")
-        st.caption("Pickup uploads are automatically filtered to your work group: 482, 483, 488, 489, 924, and active 700-series routes except 721.")
         uploaded_files = st.file_uploader(
             "Upload GAP Excel, GAP saved HTML, pickup, and stop-detail files together",
-            type=["xlsx", "xls", "html", "htm"],
+            type=["xlsx", "xls", "csv", "html", "htm"],
             accept_multiple_files=True,
             key="mixed_uploads",
         )
@@ -217,6 +219,8 @@ if page == "Update Master Data":
                 else:
                     unknown_files.append(f.name)
 
+            saved_sources = save_uploaded_source_files(paths, uploaded_files)
+
             with st.spinner("Reading uploaded files..."):
                 gap_excel_raw = read_uploaded_excels(gap_excel_files)
                 pickup_raw = read_uploaded_excels(pickup_files)
@@ -246,22 +250,7 @@ if page == "Update Master Data":
                 gap_html_stops_std = standardize_gap_html_stops(gap_html_stops_raw) if not gap_html_stops_raw.empty else pd.DataFrame()
                 gap_new = pd.concat([gap_excel_std, gap_html_stops_std], ignore_index=True) if not gap_excel_std.empty or not gap_html_stops_std.empty else pd.DataFrame()
 
-                if not pickup_raw.empty:
-                    pickup_new, pickup_scope_summary, pickup_work_area_detail = standardize_pickups(
-                        pickup_raw,
-                        filter_to_relevant=True,
-                        return_scope_summary=True,
-                    )
-                else:
-                    pickup_new = pd.DataFrame()
-                    pickup_scope_summary = {
-                        "standardized_rows_before_filter": 0,
-                        "rows_kept": 0,
-                        "rows_excluded": 0,
-                        "active_relevant_work_areas": [],
-                        "excluded_work_areas": [],
-                    }
-                    pickup_work_area_detail = pd.DataFrame()
+                pickup_new = standardize_pickups(pickup_raw) if not pickup_raw.empty else pd.DataFrame()
                 pickup_stops_new = consolidate_physical_pickups(pickup_new) if not pickup_new.empty else pd.DataFrame()
                 stop_detail_new = standardize_stop_detail(stop_detail_raw) if not stop_detail_raw.empty else pd.DataFrame()
 
@@ -274,31 +263,17 @@ if page == "Update Master Data":
             st.write("New GAP HTML route metrics rows:", len(gap_html_metrics_raw))
             st.write("New pickup raw rows:", len(pickup_raw))
             st.write("New stop-detail raw rows:", len(stop_detail_raw))
+            if saved_sources is not None and not saved_sources.empty:
+                st.write("Saved source files:", len(saved_sources))
+                st.dataframe(saved_sources[[c for c in ["saved_name", "source_name", "source_type", "saved_at"] if c in saved_sources.columns]], use_container_width=True)
             if unknown_files:
                 st.warning(f"Skipped unknown files: {unknown_files}")
 
             st.write("Standardized GAP stop rows:", len(gap_new))
-            st.write("Standardized pickup rows kept:", len(pickup_new))
+            st.write("Standardized pickup rows:", len(pickup_new))
             st.write("Consolidated pickup stop rows:", len(pickup_stops_new))
             st.write("Standardized stop-detail rows:", len(stop_detail_new))
             st.write("Standardized courier day metric rows:", len(gap_route_metrics_new))
-
-            if not pickup_raw.empty:
-                st.markdown("### Pickup work-group filter summary")
-                s1, s2, s3 = st.columns(3)
-                with s1:
-                    st.metric("Pickup rows before filter", int(pickup_scope_summary.get("standardized_rows_before_filter", 0)))
-                with s2:
-                    st.metric("Pickup rows kept", int(pickup_scope_summary.get("rows_kept", 0)))
-                with s3:
-                    st.metric("Pickup rows excluded", int(pickup_scope_summary.get("rows_excluded", 0)))
-                kept_routes = pickup_scope_summary.get("active_relevant_work_areas", [])
-                excluded_routes = pickup_scope_summary.get("excluded_work_areas", [])
-                st.write("Relevant work areas found in upload:", kept_routes if kept_routes else "None")
-                if excluded_routes:
-                    st.write("Excluded work areas seen in upload:", excluded_routes[:50])
-                if pickup_work_area_detail is not None and not pickup_work_area_detail.empty:
-                    st.dataframe(pickup_work_area_detail, use_container_width=True)
 
             with st.spinner("Appending and deduplicating master tables..."):
                 gap_master_updated = append_dedup(

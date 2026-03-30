@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from utils_processing import (
+from utils_processing_updated import (
     APP_CONFIG,
     append_dedup,
     append_ingestion_log,
@@ -25,12 +25,12 @@ from utils_processing import (
     read_stop_detail_file,
     read_uploaded_excels,
     save_master_tables,
-    save_uploaded_source_files,
     standardize_gap,
     standardize_gap_html_stops,
     standardize_gap_route_metrics,
     standardize_pickups,
     standardize_stop_detail,
+    is_our_workgroup_route,
 )
 
 st.set_page_config(page_title="Pickup Route Optimizer", layout="wide")
@@ -116,25 +116,21 @@ def _detect_file_type(file_obj) -> str:
     except Exception:
         pass
 
-    for reader in ("excel", "csv"):
-        try:
+    try:
+        file_obj.seek(0)
+        preview_df = pd.read_excel(file_obj, nrows=5)
+        cols = set(preview_df.columns.astype(str))
+        if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
             file_obj.seek(0)
-            if reader == "excel":
-                preview_df = pd.read_excel(file_obj, nrows=5)
-            else:
-                preview_df = pd.read_csv(file_obj, nrows=5)
-            cols = set(preview_df.columns.astype(str))
-            if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
-                file_obj.seek(0)
-                return "gap_excel"
-            if {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
-                file_obj.seek(0)
-                return "pickup"
-            if {"Date", "Route", "Stop Order", "Stop Type"}.issubset(cols) and {"Activity Time", "Ready Time", "Close Time"}.intersection(cols):
-                file_obj.seek(0)
-                return "stop_detail"
-        except Exception:
-            pass
+            return "gap_excel"
+        if {"Pickup Date", "Work Area #", "Ready Pickup Time", "Close Pickup Time", "Pickup Time"}.issubset(cols):
+            file_obj.seek(0)
+            return "pickup"
+        if {"Date", "Route", "Stop Order", "Stop Type"}.issubset(cols) and {"Activity Time", "Ready Time", "Close Time"}.intersection(cols):
+            file_obj.seek(0)
+            return "stop_detail"
+    except Exception:
+        pass
 
     try:
         file_obj.seek(0)
@@ -174,7 +170,7 @@ if page == "Update Master Data":
         st.subheader("Upload new source files")
         uploaded_files = st.file_uploader(
             "Upload GAP Excel, GAP saved HTML, pickup, and stop-detail files together",
-            type=["xlsx", "xls", "csv", "html", "htm"],
+            type=["xlsx", "xls", "html", "htm"],
             accept_multiple_files=True,
             key="mixed_uploads",
         )
@@ -219,8 +215,6 @@ if page == "Update Master Data":
                 else:
                     unknown_files.append(f.name)
 
-            saved_sources = save_uploaded_source_files(paths, uploaded_files)
-
             with st.spinner("Reading uploaded files..."):
                 gap_excel_raw = read_uploaded_excels(gap_excel_files)
                 pickup_raw = read_uploaded_excels(pickup_files)
@@ -263,9 +257,6 @@ if page == "Update Master Data":
             st.write("New GAP HTML route metrics rows:", len(gap_html_metrics_raw))
             st.write("New pickup raw rows:", len(pickup_raw))
             st.write("New stop-detail raw rows:", len(stop_detail_raw))
-            if saved_sources is not None and not saved_sources.empty:
-                st.write("Saved source files:", len(saved_sources))
-                st.dataframe(saved_sources[[c for c in ["saved_name", "source_name", "source_type", "saved_at"] if c in saved_sources.columns]], use_container_width=True)
             if unknown_files:
                 st.warning(f"Skipped unknown files: {unknown_files}")
 
@@ -401,7 +392,20 @@ elif page == "Analyze Existing Master":
         for df, col in [(gap_master, "route"), (pickup_stops_master, "route"), (gap_route_metrics_master, "route")]:
             if not df.empty and col in df.columns:
                 route_values.extend(pd.Series(df[col]).dropna().astype(str).tolist())
-        route_options = sorted({int(float(r)) for r in route_values if str(r).strip() not in {"", "nan"}})
+        route_options = []
+        seen_routes = set()
+        for r in route_values:
+            s = str(r).strip()
+            if not s or s.lower() == "nan":
+                continue
+            try:
+                route_no = int(float(s))
+            except Exception:
+                continue
+            if is_our_workgroup_route(route_no) and route_no not in seen_routes:
+                seen_routes.add(route_no)
+                route_options.append(route_no)
+        route_options = sorted(route_options)
 
         courier_options = []
         if not gap_route_metrics_master.empty and "courier_name" in gap_route_metrics_master.columns:

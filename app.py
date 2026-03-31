@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from utils_processing import (
+from utils_processing_updated import (
     APP_CONFIG,
     append_dedup,
     append_ingestion_log,

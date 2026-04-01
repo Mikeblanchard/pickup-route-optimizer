@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from utils_processing import (
+from utils_processing_updated import (
     APP_CONFIG,
     append_dedup,
     append_ingestion_log,
@@ -30,7 +30,6 @@ from utils_processing import (
     standardize_gap_route_metrics,
     standardize_pickups,
     standardize_stop_detail,
-    is_our_workgroup_route,
 )
 
 st.set_page_config(page_title="Pickup Route Optimizer", layout="wide")
@@ -392,26 +391,8 @@ elif page == "Analyze Existing Master":
         for df, col in [(gap_master, "route"), (pickup_stops_master, "route"), (gap_route_metrics_master, "route")]:
             if not df.empty and col in df.columns:
                 route_values.extend(pd.Series(df[col]).dropna().astype(str).tolist())
-        route_options = []
-        seen_routes = set()
-        for r in route_values:
-            s = str(r).strip()
-            if not s or s.lower() == "nan":
-                continue
-            try:
-                route_no = int(float(s))
-            except Exception:
-                continue
-            if is_our_workgroup_route(route_no) and route_no not in seen_routes:
-                seen_routes.add(route_no)
-                route_options.append(route_no)
-        route_options = sorted(route_options)
+        route_options = sorted({int(float(r)) for r in route_values if str(r).strip() not in {"", "nan"}})
 
-        courier_options = []
-        if not gap_route_metrics_master.empty and "courier_name" in gap_route_metrics_master.columns:
-            courier_options = sorted([c for c in gap_route_metrics_master["courier_name"].dropna().astype(str).unique().tolist() if c.strip()])
-
-        c1, c2, c3, c4 = st.columns(4)
         with c1:
             selected_routes = st.multiselect("Filter routes", options=route_options, default=[])
         with c2:
@@ -467,7 +448,7 @@ elif page == "Analyze Existing Master":
 
             with st.spinner("Building summaries..."):
                 route_day_summary = build_route_day_summary(gap_f, pickup_stops_f)
-                best_matches, match_report = match_pickups_to_gap(gap_f, pickup_stops_f, tolerance_min=tolerance)
+                best_matches, match_report = match_pickups_to_gap(gap_f, pickup_stops_f, tolerance_min=APP_CONFIG["pickup_match_tolerance_min"])
                 stop_detail_xref = cross_reference_stop_detail(stop_detail_f, gap_f, pickup_master) if not stop_detail_f.empty else pd.DataFrame()
                 courier_changes = build_courier_day_changes(metrics_f)
 

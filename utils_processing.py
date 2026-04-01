@@ -1223,181 +1223,180 @@ def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=Non
 
 
 def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
-    """Customer-stop-only large gaps with before/after leg context.
+    """Customer-stop-only large gaps with customer-to-customer leg context.
 
-    The flagged row is the current customer stop where the long gap ended, but the
-    output also includes the previous stop so the result reads like a movement leg:
-    before_address -> after_address, before_time -> after_time.
+    The displayed leg is the previous customer stop -> current customer stop.
+    If a break happens between those two customer stops, the displayed gap is
+    recalculated as elapsed minutes minus break minutes between them.
+    Route thresholding is still based on route-level customer-stop GAP history.
     """
-    if gap_df is None or gap_df.empty:
+    if gap_df is None or len(gap_df) == 0:
         return pd.DataFrame()
 
-    def _prep_gap_frame(df):
-        x = df.copy()
-        x["scan_date"] = pd.to_datetime(x.get("scan_date"), errors="coerce").dt.normalize()
-        if "route" in x.columns:
-            x["route"] = pd.to_numeric(x["route"], errors="coerce").astype("Int64")
-        if "stop_order" in x.columns:
-            x["stop_order"] = pd.to_numeric(x["stop_order"], errors="coerce")
-        if "gap_minutes" in x.columns:
-            x["gap_minutes"] = pd.to_numeric(x["gap_minutes"], errors="coerce")
-        if "fedex_id" in x.columns:
-            x["fedex_id"] = x["fedex_id"].astype(str)
-        if "activity_dt" in x.columns:
-            x["activity_dt"] = pd.to_datetime(x["activity_dt"], errors="coerce")
+    df_all = gap_df.copy()
+    history_source = gap_history.copy() if gap_history is not None and len(gap_history) else df_all.copy()
 
-        if "is_event_row" not in x.columns:
-            x["is_event_row"] = x.get("address", pd.Series("", index=x.index)).astype(str).str.startswith("*")
-        stop_type_upper = x.get("stop_type", pd.Series("", index=x.index)).astype(str).str.upper()
-        if "is_pickup_like" not in x.columns:
-            x["is_pickup_like"] = stop_type_upper.str.contains("PU", na=False)
-        if "is_delivery_like" not in x.columns:
-            x["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
+    def _normalize(x):
+        y = x.copy()
+        if 'scan_date' in y.columns:
+            y['scan_date'] = pd.to_datetime(y['scan_date'], errors='coerce')
+        if 'activity_dt' in y.columns:
+            y['activity_dt'] = pd.to_datetime(y['activity_dt'], errors='coerce')
+        if 'gap_minutes' in y.columns:
+            y['gap_minutes'] = pd.to_numeric(y['gap_minutes'], errors='coerce')
+        if 'stop_order' in y.columns:
+            y['stop_order'] = pd.to_numeric(y['stop_order'], errors='coerce')
+        if 'route' in y.columns:
+            y['route'] = y['route'].astype(str).str.strip()
+        if 'address' in y.columns:
+            y['address'] = y['address'].astype(str).str.strip()
+        if 'stop_type' in y.columns:
+            y['stop_type'] = y['stop_type'].astype(str).str.strip()
+        if 'fedex_id' in y.columns:
+            y['fedex_id'] = y['fedex_id'].astype(str).str.strip()
+        if 'is_event_row' not in y.columns:
+            y['is_event_row'] = y.get('address', pd.Series('', index=y.index)).astype(str).str.startswith('*')
+        addr_upper = y.get('address', pd.Series('', index=y.index)).astype(str).str.upper()
+        stop_type_upper = y.get('stop_type', pd.Series('', index=y.index)).astype(str).str.upper()
+        y['is_break_begin'] = addr_upper.str.contains('BEGIN BREAK', na=False)
+        y['is_break_end'] = addr_upper.str.contains('END BREAK', na=False)
+        y['is_pickup_like'] = y.get('is_pickup_like', stop_type_upper.str.contains('PU', na=False))
+        y['is_delivery_like'] = y.get('is_delivery_like', stop_type_upper.str.contains('DL', na=False))
+        return y
 
-        x = x[(~x["is_event_row"].fillna(False)) & (x["gap_minutes"].notna())].copy()
-        if x.empty:
-            return x
+    df_all = _normalize(df_all)
+    history_source = _normalize(history_source)
 
-        group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in x.columns]
-        sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in x.columns]
-        if sort_cols:
-            x = x.sort_values(sort_cols).copy()
+    sort_cols = [c for c in ['scan_date', 'route', 'fedex_id', 'activity_dt', 'stop_order'] if c in df_all.columns]
+    if sort_cols:
+        df_all = df_all.sort_values(sort_cols).copy()
+    hist_sort_cols = [c for c in ['scan_date', 'route', 'fedex_id', 'activity_dt', 'stop_order'] if c in history_source.columns]
+    if hist_sort_cols:
+        history_source = history_source.sort_values(hist_sort_cols).copy()
 
-        x["is_customer_stop"] = True
-        if exclude_first_stop_gap and group_cols:
-            first_idx = x.groupby(group_cols, dropna=False).head(1).index
-            x["is_first_customer_stop"] = False
-            x.loc[first_idx, "is_first_customer_stop"] = True
+    grp_cols = [c for c in ['scan_date', 'route', 'fedex_id'] if c in df_all.columns]
+
+    customer = df_all.copy()
+    if 'is_event_row' in customer.columns:
+        customer = customer[~customer['is_event_row'].fillna(False)].copy()
+    if 'stop_order' in customer.columns:
+        customer = customer[customer['stop_order'].notna()].copy()
+    if customer.empty:
+        return pd.DataFrame()
+
+    if grp_cols:
+        customer = customer.sort_values([c for c in ['scan_date', 'route', 'fedex_id', 'activity_dt', 'stop_order'] if c in customer.columns]).copy()
+        customer['_rownum_in_day'] = customer.groupby(grp_cols, dropna=False).cumcount() + 1
+        customer['prev_stop_order'] = customer.groupby(grp_cols, dropna=False)['stop_order'].shift(1) if 'stop_order' in customer.columns else np.nan
+        customer['prev_stop_type'] = customer.groupby(grp_cols, dropna=False)['stop_type'].shift(1) if 'stop_type' in customer.columns else None
+        customer['prev_address'] = customer.groupby(grp_cols, dropna=False)['address'].shift(1) if 'address' in customer.columns else None
+        customer['prev_activity_dt'] = customer.groupby(grp_cols, dropna=False)['activity_dt'].shift(1) if 'activity_dt' in customer.columns else pd.NaT
+    else:
+        customer['_rownum_in_day'] = np.arange(1, len(customer) + 1)
+        customer['prev_stop_order'] = customer['stop_order'].shift(1) if 'stop_order' in customer.columns else np.nan
+        customer['prev_stop_type'] = customer['stop_type'].shift(1) if 'stop_type' in customer.columns else None
+        customer['prev_address'] = customer['address'].shift(1) if 'address' in customer.columns else None
+        customer['prev_activity_dt'] = customer['activity_dt'].shift(1) if 'activity_dt' in customer.columns else pd.NaT
+
+    if exclude_first_stop_gap:
+        customer = customer[customer['_rownum_in_day'] > 1].copy()
+    if customer.empty:
+        return pd.DataFrame()
+
+    def _break_minutes_between(group):
+        group = group.sort_values([c for c in ['activity_dt', 'stop_order'] if c in group.columns]).copy()
+        out = pd.Series(0.0, index=group.index, dtype='float64')
+        if group.empty:
+            return out
+        if grp_cols:
+            first_idx = group.index[0]
+            mask = pd.Series(True, index=df_all.index)
+            for c in grp_cols:
+                mask &= (df_all[c] == group.loc[first_idx, c])
+            all_group = df_all[mask].sort_values([c for c in ['activity_dt', 'stop_order'] if c in df_all.columns]).copy()
         else:
-            x["is_first_customer_stop"] = False
+            all_group = df_all.sort_values([c for c in ['activity_dt', 'stop_order'] if c in df_all.columns]).copy()
+        break_starts = all_group[all_group['is_break_begin'].fillna(False)]
+        break_ends = all_group[all_group['is_break_end'].fillna(False)]
+        if break_starts.empty or break_ends.empty:
+            return out
+        for idx, row in group.iterrows():
+            prev_t = row.get('prev_activity_dt')
+            curr_t = row.get('activity_dt')
+            mins = 0.0
+            if pd.notna(prev_t) and pd.notna(curr_t):
+                starts_in_window = break_starts[(break_starts['activity_dt'] > prev_t) & (break_starts['activity_dt'] < curr_t)]
+                for _, bs in starts_in_window.iterrows():
+                    be = break_ends[break_ends['activity_dt'] > bs['activity_dt']].head(1)
+                    if not be.empty and pd.notna(be.iloc[0]['activity_dt']):
+                        mins += max(0.0, (be.iloc[0]['activity_dt'] - bs['activity_dt']).total_seconds() / 60.0)
+            out.loc[idx] = mins
+        return out
 
-        if group_cols:
-            grp = x.groupby(group_cols, dropna=False)
-            x["prev_stop_order"] = grp["stop_order"].shift(1) if "stop_order" in x.columns else np.nan
-            x["prev_stop_type"] = grp["stop_type"].shift(1) if "stop_type" in x.columns else None
-            x["prev_address"] = grp["address"].shift(1) if "address" in x.columns else None
-            x["prev_activity_dt"] = grp["activity_dt"].shift(1) if "activity_dt" in x.columns else pd.NaT
-        else:
-            x["prev_stop_order"] = np.nan
-            x["prev_stop_type"] = None
-            x["prev_address"] = None
-            x["prev_activity_dt"] = pd.NaT
+    if grp_cols:
+        customer['break_minutes_between'] = customer.groupby(grp_cols, dropna=False, group_keys=False).apply(_break_minutes_between)
+    else:
+        customer['break_minutes_between'] = _break_minutes_between(customer)
+    customer['break_minutes_between'] = pd.to_numeric(customer['break_minutes_between'], errors='coerce').fillna(0.0)
 
-        x["before_address"] = x["prev_address"].fillna("(start)").astype(str).str.strip()
-        x["after_address"] = x.get("address", pd.Series("", index=x.index)).fillna("(unknown)").astype(str).str.strip()
-        x["before_time"] = np.where(x["prev_activity_dt"].notna(), x["prev_activity_dt"].dt.strftime("%H:%M"), None)
-        x["after_time"] = np.where(x["activity_dt"].notna(), x["activity_dt"].dt.strftime("%H:%M"), None)
-        x["gap_from_to"] = x["before_address"] + " -> " + x["after_address"]
-        x["gap_time_window"] = np.where(
-            pd.Series(x["before_time"], index=x.index).notna() & pd.Series(x["after_time"], index=x.index).notna(),
-            pd.Series(x["before_time"], index=x.index).astype(str) + " -> " + pd.Series(x["after_time"], index=x.index).astype(str),
-            None,
-        )
-        return x
-
-    g = _prep_gap_frame(gap_df)
-    if g.empty:
-        return pd.DataFrame()
-
-    base = g[~g["is_first_customer_stop"]].copy() if exclude_first_stop_gap else g.copy()
-    if base.empty:
-        return pd.DataFrame()
-
-    history_source = gap_history if gap_history is not None and not getattr(gap_history, "empty", True) else gap_df
-    h = _prep_gap_frame(history_source)
-    history_base = h[~h["is_first_customer_stop"]].copy() if (exclude_first_stop_gap and not h.empty) else h.copy()
-    if history_base.empty:
-        history_base = base.copy()
-
-    route_stats = (
-        history_base.groupby("route", dropna=False)["gap_minutes"]
-        .agg(route_gap_median="median", route_gap_p90=lambda s: float(s.quantile(0.90)))
-        .reset_index()
+    customer['leg_elapsed_minutes'] = np.where(
+        customer['prev_activity_dt'].notna() & customer['activity_dt'].notna(),
+        (customer['activity_dt'] - customer['prev_activity_dt']).dt.total_seconds() / 60.0,
+        np.nan,
     )
-    if route_stats.empty:
+    customer['adjusted_gap_minutes'] = (customer['leg_elapsed_minutes'] - customer['break_minutes_between']).clip(lower=0)
+
+    hist_customer = history_source.copy()
+    if 'is_event_row' in hist_customer.columns:
+        hist_customer = hist_customer[~hist_customer['is_event_row'].fillna(False)].copy()
+    if 'stop_order' in hist_customer.columns:
+        hist_customer = hist_customer[hist_customer['stop_order'].notna()].copy()
+    if hist_customer.empty or 'gap_minutes' not in hist_customer.columns:
+        return pd.DataFrame()
+    if exclude_first_stop_gap and grp_cols:
+        hist_customer = hist_customer.sort_values([c for c in ['scan_date', 'route', 'fedex_id', 'activity_dt', 'stop_order'] if c in hist_customer.columns]).copy()
+        hist_customer['_rownum_in_day'] = hist_customer.groupby(grp_cols, dropna=False).cumcount() + 1
+        hist_customer = hist_customer[hist_customer['_rownum_in_day'] > 1].copy()
+    if hist_customer.empty:
         return pd.DataFrame()
 
-    route_stats["route_gap_threshold"] = route_stats.apply(
-        lambda r: max(
-            float(r["route_gap_p90"]) if pd.notna(r["route_gap_p90"]) else float("-inf"),
-            (float(r["route_gap_median"]) * 2.0) if pd.notna(r["route_gap_median"]) else float("-inf"),
-            float(floor_minutes),
-        ),
-        axis=1,
-    )
+    route_stats = hist_customer.groupby('route', dropna=False)['gap_minutes'].agg(
+        route_gap_median='median',
+        route_gap_p90=lambda s: s.quantile(0.90)
+    ).reset_index()
+    route_stats['route_gap_threshold'] = route_stats.apply(
+        lambda r: max(float(r['route_gap_p90']) if pd.notna(r['route_gap_p90']) else 0.0,
+                      float(r['route_gap_median']) * 2.0 if pd.notna(r['route_gap_median']) else 0.0,
+                      float(floor_minutes)), axis=1)
 
-    out = base.merge(route_stats, on="route", how="left")
-    out = out[out["gap_minutes"] >= out["route_gap_threshold"]].copy()
+    out = customer.merge(route_stats, on='route', how='left')
+    out = out[pd.to_numeric(out['adjusted_gap_minutes'], errors='coerce') >= pd.to_numeric(out['route_gap_threshold'], errors='coerce')].copy()
     if out.empty:
         return out
 
-    out["severity_ratio"] = out["gap_minutes"] / out["route_gap_threshold"]
-    out["severity_band"] = np.select(
-        [out["severity_ratio"] >= 2.0, out["severity_ratio"] >= 1.5, out["severity_ratio"] >= 1.2],
-        ["High", "Medium", "Watch"],
-        default="Watch",
+    out['severity_ratio'] = pd.to_numeric(out['adjusted_gap_minutes'], errors='coerce') / pd.to_numeric(out['route_gap_threshold'], errors='coerce').replace(0, np.nan)
+    out['severity_band'] = np.select(
+        [out['severity_ratio'] >= 2.0, out['severity_ratio'] >= 1.5, out['severity_ratio'] >= 1.0],
+        ['High','Medium','Watch'],
+        default='Watch'
     )
-    out["explanation_note"] = np.where(
-        out.get("is_pickup_like", False),
-        "Pickup stop gap needs review",
-        "Customer stop gap needs review",
-    )
+    out['before_address'] = out.get('prev_address', pd.Series('', index=out.index)).fillna('').astype(str).str.strip()
+    out['after_address'] = out.get('address', pd.Series('', index=out.index)).fillna('').astype(str).str.strip()
+    out['before_time'] = pd.to_datetime(out.get('prev_activity_dt'), errors='coerce').dt.strftime('%H:%M') if 'prev_activity_dt' in out.columns else None
+    out['after_time'] = pd.to_datetime(out.get('activity_dt'), errors='coerce').dt.strftime('%H:%M') if 'activity_dt' in out.columns else None
+    out['gap_from_to'] = out['before_address'].fillna('') + ' -> ' + out['after_address'].fillna('')
+    out['gap_time_window'] = out['before_time'].fillna('') + ' -> ' + out['after_time'].fillna('')
+    if 'scan_date' in out.columns:
+        out['scan_date'] = pd.to_datetime(out['scan_date'], errors='coerce').dt.strftime('%Y-%m-%d')
 
     preferred_cols = [
-        "scan_date",
-        "route",
-        "fedex_id",
-        "courier_name",
-        "prev_stop_order",
-        "stop_order",
-        "prev_stop_type",
-        "stop_type",
-        "before_address",
-        "after_address",
-        "before_time",
-        "after_time",
-        "gap_minutes",
-        "route_gap_median",
-        "route_gap_p90",
-        "route_gap_threshold",
-        "severity_ratio",
-        "severity_band",
-        "gap_from_to",
-        "gap_time_window",
-        "explanation_note",
+        'scan_date', 'route', 'courier_name', 'fedex_id',
+        'before_address', 'after_address', 'before_time', 'after_time',
+        'adjusted_gap_minutes', 'break_minutes_between', 'leg_elapsed_minutes', 'gap_minutes',
+        'stop_type', 'route_gap_median', 'route_gap_p90', 'route_gap_threshold',
+        'severity_ratio', 'severity_band', 'gap_from_to', 'gap_time_window'
     ]
-    existing_preferred = [c for c in preferred_cols if c in out.columns]
-    remaining = [c for c in out.columns if c not in existing_preferred]
-    out = out[existing_preferred + remaining]
+    remaining = [c for c in out.columns if c not in preferred_cols]
+    out = out[[c for c in preferred_cols if c in out.columns] + remaining]
+    return out.sort_values(['severity_ratio', 'adjusted_gap_minutes'], ascending=[False, False]).reset_index(drop=True)
 
-    out = out.sort_values(
-        [c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns],
-        ascending=[True, True, False],
-    )
-    return out
-
-    out["severity_ratio"] = out["gap_minutes"] / out["route_gap_threshold"]
-    out["severity_band"] = np.select(
-        [out["severity_ratio"] >= 2.0, out["severity_ratio"] >= 1.5, out["severity_ratio"] >= 1.2],
-        ["High", "Medium", "Watch"],
-        default="Watch",
-    )
-    out["explanation_note"] = np.where(
-        out.get("is_pickup_like", False),
-        "Pickup stop gap needs review",
-        "Customer stop gap needs review",
-    )
-    out = out.sort_values(
-        [c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns],
-        ascending=[True, True, False],
-    )
-    cols = [
-        "scan_date", "route", "fedex_id",
-        "prev_stop_order", "prev_stop_type", "prev_address", "prev_activity_dt",
-        "stop_order", "stop_type", "address", "activity_dt",
-        "gap_from_to", "gap_time_window",
-        "gap_minutes", "route_gap_median", "route_gap_p90", "route_gap_threshold",
-        "severity_ratio", "severity_band", "explanation_note",
-    ]
-    cols = [c for c in cols if c in out.columns]
-    return out[cols].reset_index(drop=True)

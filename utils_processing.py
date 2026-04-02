@@ -24,6 +24,28 @@ APP_CONFIG = {
 }
 
 
+OUR_WORKGROUP_EXPLICIT = {482, 483, 488, 489, 924}
+OUR_WORKGROUP_RANGE = range(702, 800)
+OUR_WORKGROUP_EXCLUDE = {721}
+
+def is_relevant_workgroup_route(x):
+    try:
+        if pd.isna(x):
+            return False
+        r = int(float(x))
+    except Exception:
+        return False
+    if r in OUR_WORKGROUP_EXCLUDE:
+        return False
+    return r in OUR_WORKGROUP_EXPLICIT or r in OUR_WORKGROUP_RANGE
+
+def filter_to_our_workgroup(df, route_col='route'):
+    if df is None or df.empty or route_col not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    mask = out[route_col].apply(is_relevant_workgroup_route)
+    return out.loc[mask].copy()
+
 # -----------------------------
 # Files / storage
 # -----------------------------
@@ -327,9 +349,13 @@ def read_uploaded_excels(uploaded_files):
     frames = []
     for f in uploaded_files:
         try:
+            name = getattr(f, "name", "").lower()
             f.seek(0)
-            df = pd.read_excel(f)
-            df["source_file"] = getattr(f, "name", "uploaded_excel")
+            if name.endswith('.csv'):
+                df = pd.read_csv(f)
+            else:
+                df = pd.read_excel(f)
+            df["source_file"] = getattr(f, "name", "uploaded_file")
             frames.append(df)
         except Exception:
             pass
@@ -483,6 +509,7 @@ def standardize_pickups(df):
     p["wave_start_dt"] = p.apply(lambda r: combine_date_and_time(r.get("pickup_date"), r.get("wave_start_time")), axis=1)
     p["route"] = p["work_area_no"].astype("Int64") if "work_area_no" in p.columns else pd.Series(dtype="Int64")
     p["reason_text"] = p.get("reason_code", pd.Series(dtype=float)).map(APP_CONFIG["reason_code_map"]).fillna("")
+    p = filter_to_our_workgroup(p, "route")
     return p
 
 
@@ -1148,13 +1175,14 @@ def build_courier_day_changes(gap_route_metrics_df):
         return pd.DataFrame()
     df = gap_route_metrics_df.copy()
     df["scan_date"] = pd.to_datetime(df["scan_date"], errors="coerce")
-    df["fedex_id"] = df["fedex_id"].astype(str)
-    sort_cols = [c for c in ["fedex_id", "scan_date", "route"] if c in df.columns]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
-
+    df["fedex_id"] = df.get("fedex_id", pd.Series("", index=df.index)).astype(str)
+    if "route" in df.columns:
+        df["route"] = pd.to_numeric(df["route"], errors="coerce").astype("Int64")
+    df = df.sort_values([c for c in ["fedex_id", "scan_date", "route"] if c in df.columns]).reset_index(drop=True)
     diff_cols = [
         "actual_sth_oa", "actual_sth_or", "actual_hr_oa_min", "actual_hr_or_min",
-        "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual", "customer_stop_count", "miles_on_road",
+        "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual",
+        "customer_stop_count", "miles_on_road",
     ]
     group = df.groupby("fedex_id", dropna=False)
     df["previous_date"] = group["scan_date"].shift(1)
@@ -1167,140 +1195,144 @@ def build_courier_day_changes(gap_route_metrics_df):
     return df
 
 
-
 def build_route_performance_benchmarks(gap_route_metrics_df, metrics_history=None):
-    """One row per route-day with route-level benchmark columns."""
     if gap_route_metrics_df is None or gap_route_metrics_df.empty:
         return pd.DataFrame()
-    df = gap_route_metrics_df.copy()
-    df["scan_date"] = pd.to_datetime(df.get("scan_date"), errors="coerce").dt.normalize()
-    if "route" in df.columns:
-        df["route"] = pd.to_numeric(df["route"], errors="coerce").astype("Int64")
-    if "courier_name" in df.columns:
-        df["courier_name"] = df["courier_name"].astype(str)
+    cur = gap_route_metrics_df.copy()
+    hist = metrics_history.copy() if metrics_history is not None and not metrics_history.empty else cur.copy()
+    for df in (cur, hist):
+        if "scan_date" in df.columns:
+            df["scan_date"] = pd.to_datetime(df["scan_date"], errors="coerce")
+        if "route" in df.columns:
+            df["route"] = pd.to_numeric(df["route"], errors="coerce").astype("Int64")
+        if "courier_name" in df.columns:
+            df["courier_name"] = df["courier_name"].astype(str)
+    cur["weekday"] = cur["scan_date"].dt.day_name()
+    hist["weekday"] = hist["scan_date"].dt.day_name()
+    overall_oa = hist["actual_sth_oa"].dropna().mean() if "actual_sth_oa" in hist.columns else np.nan
+    overall_or = hist["actual_sth_or"].dropna().mean() if "actual_sth_or" in hist.columns else np.nan
+    cur["overall_avg_sth_oa"] = overall_oa
+    cur["overall_avg_sth_or"] = overall_or
+    route_hist = hist.groupby("route", dropna=False).agg(
+        route_all_history_avg_sth_oa=("actual_sth_oa", "mean"),
+        route_all_history_avg_sth_or=("actual_sth_or", "mean"),
+    ).reset_index()
+    cur = cur.merge(route_hist, on="route", how="left")
+    prev7_oa, prev7_or, samewd_oa, samewd_or = [], [], [], []
+    for _, row in cur.iterrows():
+        h = hist[hist["route"] == row["route"]].copy()
+        h = h[h["scan_date"] < row["scan_date"]].sort_values("scan_date")
+        prev7 = h.tail(7)
+        prev7_oa.append(prev7["actual_sth_oa"].dropna().mean() if "actual_sth_oa" in prev7.columns and not prev7.empty else np.nan)
+        prev7_or.append(prev7["actual_sth_or"].dropna().mean() if "actual_sth_or" in prev7.columns and not prev7.empty else np.nan)
+        same = h[h["weekday"] == row["weekday"]]
+        samewd_oa.append(same["actual_sth_oa"].dropna().mean() if "actual_sth_oa" in same.columns and not same.empty else np.nan)
+        samewd_or.append(same["actual_sth_or"].dropna().mean() if "actual_sth_or" in same.columns and not same.empty else np.nan)
+    cur["route_prev_7_obs_avg_sth_oa"] = prev7_oa
+    cur["route_prev_7_obs_avg_sth_or"] = prev7_or
+    cur["route_same_weekday_avg_sth_oa"] = samewd_oa
+    cur["route_same_weekday_avg_sth_or"] = samewd_or
+    for lhs, rhs, out in [
+        ("actual_sth_oa", "overall_avg_sth_oa", "delta_vs_overall_oa"),
+        ("actual_sth_or", "overall_avg_sth_or", "delta_vs_overall_or"),
+        ("actual_sth_oa", "route_all_history_avg_sth_oa", "delta_vs_route_all_history_oa"),
+        ("actual_sth_or", "route_all_history_avg_sth_or", "delta_vs_route_all_history_or"),
+        ("actual_sth_oa", "route_prev_7_obs_avg_sth_oa", "delta_vs_prev_7_obs_oa"),
+        ("actual_sth_or", "route_prev_7_obs_avg_sth_or", "delta_vs_prev_7_obs_or"),
+        ("actual_sth_oa", "route_same_weekday_avg_sth_oa", "delta_vs_same_weekday_oa"),
+        ("actual_sth_or", "route_same_weekday_avg_sth_or", "delta_vs_same_weekday_or"),
+    ]:
+        if lhs in cur.columns and rhs in cur.columns:
+            cur[out] = cur[lhs] - cur[rhs]
+    return cur
 
-    df = df.sort_values([c for c in ["route", "scan_date", "fedex_id"] if c in df.columns]).reset_index(drop=True)
-    df["weekday"] = df["scan_date"].dt.day_name()
 
-    for metric in ["actual_sth_oa", "actual_sth_or"]:
-        if metric in df.columns:
-            df[f"overall_avg_{metric}"] = df[metric].mean()
-            df[f"route_all_history_avg_{metric}"] = df.groupby("route", dropna=False)[metric].transform("mean")
-            df[f"route_prev_7_obs_avg_{metric}"] = (
-                df.groupby("route", dropna=False)[metric]
-                .transform(lambda s: s.shift(1).rolling(7, min_periods=1).mean())
-            )
-            same_weekday_vals = []
-            for _, grp in df.groupby(["route", "weekday"], dropna=False):
-                same_weekday_vals.append(grp[metric].shift(1).expanding(min_periods=1).mean())
-            if same_weekday_vals:
-                df[f"route_same_weekday_avg_{metric}"] = pd.concat(same_weekday_vals).sort_index()
-            for prefix in ["overall_avg", "route_all_history_avg", "route_prev_7_obs_avg", "route_same_weekday_avg"]:
-                bcol = f"{prefix}_{metric}"
-                dcol = metric.replace("actual_", "")
-                if bcol in df.columns:
-                    df[f"delta_vs_{prefix}_{dcol}"] = df[metric] - df[bcol]
-                    df[f"pct_vs_{prefix}_{dcol}"] = np.where(df[bcol].fillna(0) != 0, (df[metric] - df[bcol]) / df[bcol] * 100.0, np.nan)
-
-    desired = [
-        "scan_date", "weekday", "route", "courier_name", "fedex_id",
-        "actual_sth_oa", "actual_sth_or", "gap_sum_minutes_all", "gap_sum_minutes_customer", "total_stops_actual",
-        "overall_avg_actual_sth_oa", "overall_avg_actual_sth_or",
-        "route_all_history_avg_actual_sth_oa", "route_all_history_avg_actual_sth_or",
-        "route_prev_7_obs_avg_actual_sth_oa", "route_prev_7_obs_avg_actual_sth_or",
-        "route_same_weekday_avg_actual_sth_oa", "route_same_weekday_avg_actual_sth_or",
-        "delta_vs_route_all_history_avg_sth_oa", "delta_vs_route_all_history_avg_sth_or",
-        "delta_vs_route_prev_7_obs_avg_sth_oa", "delta_vs_route_prev_7_obs_avg_sth_or",
-        "delta_vs_route_same_weekday_avg_sth_oa", "delta_vs_route_same_weekday_avg_sth_or",
-        "pct_vs_route_all_history_avg_sth_oa", "pct_vs_route_all_history_avg_sth_or",
-        "pct_vs_route_prev_7_obs_avg_sth_oa", "pct_vs_route_prev_7_obs_avg_sth_or",
-        "pct_vs_route_same_weekday_avg_sth_oa", "pct_vs_route_same_weekday_avg_sth_or",
-    ]
-    existing = [c for c in desired if c in df.columns]
-    extra = [c for c in df.columns if c not in existing]
-    return df[existing + extra]
-
-
-
-def build_large_gap_exceptions(gap_df, floor_minutes=10.0, exclude_first_stop_gap=True):
-    """Customer-stop-only large gaps. Optionally excludes the first customer stop of the day/route,
-    since that GAP usually represents leave-building to first-stop stem time rather than on-area pacing."""
+def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=10.0, exclude_first_stop_gap=True):
     if gap_df is None or gap_df.empty:
         return pd.DataFrame()
 
-    g = gap_df.copy()
-    g["scan_date"] = pd.to_datetime(g.get("scan_date"), errors="coerce").dt.normalize()
-    if "route" in g.columns:
-        g["route"] = pd.to_numeric(g["route"], errors="coerce").astype("Int64")
-    if "stop_order" in g.columns:
-        g["stop_order"] = pd.to_numeric(g["stop_order"], errors="coerce")
-    if "gap_minutes" in g.columns:
-        g["gap_minutes"] = pd.to_numeric(g["gap_minutes"], errors="coerce")
-    if "fedex_id" in g.columns:
-        g["fedex_id"] = g["fedex_id"].astype(str)
+    def _prep(df):
+        d = df.copy()
+        if "scan_date" in d.columns:
+            d["scan_date"] = pd.to_datetime(d["scan_date"], errors="coerce").dt.normalize()
+        if "route" in d.columns:
+            d["route"] = pd.to_numeric(d["route"], errors="coerce").astype("Int64")
+        d["fedex_id"] = d.get("fedex_id", pd.Series("", index=d.index)).astype(str)
+        d["courier_name"] = d.get("courier_name", pd.Series("", index=d.index)).astype(str)
+        d["activity_dt"] = pd.to_datetime(d.get("activity_dt"), errors="coerce")
+        d["stop_order"] = pd.to_numeric(d.get("stop_order"), errors="coerce")
+        d["gap_minutes"] = pd.to_numeric(d.get("gap_minutes"), errors="coerce")
+        d["address"] = d.get("address", pd.Series("", index=d.index)).astype(str)
+        d["stop_type"] = d.get("stop_type", pd.Series("", index=d.index)).astype(str)
+        if "is_event_row" not in d.columns:
+            d["is_event_row"] = d["address"].str.startswith("*")
+        d["event_type"] = np.where(d["is_event_row"], d["address"].str.replace(r"^\*\d+-", "", regex=True).str.upper(), "")
+        d["is_customer_stop"] = ~d["is_event_row"].fillna(False)
+        return d
 
-    if "is_event_row" not in g.columns:
-        g["is_event_row"] = g.get("address", pd.Series("", index=g.index)).astype(str).str.startswith("*")
-    if "is_pickup_like" not in g.columns:
-        stop_type_upper = g.get("stop_type", pd.Series("", index=g.index)).astype(str).str.upper()
-        g["is_pickup_like"] = stop_type_upper.str.contains("PU", na=False)
-    if "is_delivery_like" not in g.columns:
-        stop_type_upper = g.get("stop_type", pd.Series("", index=g.index)).astype(str).str.upper()
-        g["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
+    def _customer_legs(d):
+        d = _prep(d)
+        grp_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in d.columns]
+        rows = []
+        if not grp_cols:
+            return pd.DataFrame()
+        for _, grp in d.sort_values([c for c in grp_cols + ["activity_dt", "stop_order"] if c in d.columns]).groupby(grp_cols, dropna=False):
+            grp = grp.reset_index(drop=True)
+            cust_idx = grp.index[grp["is_customer_stop"] & grp["activity_dt"].notna()].tolist()
+            if exclude_first_stop_gap and cust_idx:
+                cust_idx = cust_idx[1:]
+            for cur_idx in cust_idx:
+                prev_candidates = grp.index[(grp.index < cur_idx) & grp["is_customer_stop"] & grp["activity_dt"].notna()].tolist()
+                if not prev_candidates:
+                    continue
+                prev_idx = prev_candidates[-1]
+                prev = grp.loc[prev_idx]
+                cur_row = grp.loc[cur_idx]
+                between = grp.loc[(grp.index > prev_idx) & (grp.index < cur_idx)].copy()
+                begin_times = between.loc[between["event_type"].str.contains("BEGIN BREAK", na=False), "activity_dt"].tolist()
+                end_times = between.loc[between["event_type"].str.contains("END BREAK", na=False), "activity_dt"].tolist()
+                break_mins = 0.0
+                for bt in begin_times:
+                    et = next((x for x in end_times if pd.notna(x) and pd.notna(bt) and x >= bt), None)
+                    if et is not None:
+                        break_mins += max((et - bt).total_seconds()/60.0, 0.0)
+                leg_elapsed = (cur_row["activity_dt"] - prev["activity_dt"]).total_seconds()/60.0 if pd.notna(cur_row["activity_dt"]) and pd.notna(prev["activity_dt"]) else np.nan
+                adjusted = leg_elapsed - break_mins if pd.notna(leg_elapsed) else np.nan
+                rows.append({
+                    "scan_date": cur_row.get("scan_date"),
+                    "route": cur_row.get("route"),
+                    "fedex_id": cur_row.get("fedex_id"),
+                    "courier_name": cur_row.get("courier_name"),
+                    "stop_order": cur_row.get("stop_order"),
+                    "stop_type": cur_row.get("stop_type"),
+                    "before_address": prev.get("address"),
+                    "after_address": cur_row.get("address"),
+                    "before_time": prev.get("activity_dt").strftime("%H:%M") if pd.notna(prev.get("activity_dt")) else "",
+                    "after_time": cur_row.get("activity_dt").strftime("%H:%M") if pd.notna(cur_row.get("activity_dt")) else "",
+                    "leg_elapsed_minutes": leg_elapsed,
+                    "break_minutes_between": break_mins,
+                    "adjusted_gap_minutes": adjusted,
+                    "gap_from_to": f"{prev.get('address','')} -> {cur_row.get('address','')}",
+                    "gap_time_window": f"{prev.get('activity_dt').strftime('%H:%M') if pd.notna(prev.get('activity_dt')) else ''} -> {cur_row.get('activity_dt').strftime('%H:%M') if pd.notna(cur_row.get('activity_dt')) else ''}",
+                    "source_file": cur_row.get("source_file"),
+                })
+        return pd.DataFrame(rows)
 
-    # Customer stops only.
-    g = g[(~g["is_event_row"].fillna(False)) & (g["gap_minutes"].notna())].copy()
-    if g.empty:
+    cur_legs = _customer_legs(gap_df)
+    hist_legs = _customer_legs(gap_history if gap_history is not None and not gap_history.empty else gap_df)
+    if cur_legs.empty or hist_legs.empty:
         return pd.DataFrame()
-
-    g["is_customer_stop"] = True
-
-    # Identify first customer stop per courier-route-day and exclude from exception logic.
-    group_cols = [c for c in ["scan_date", "route", "fedex_id"] if c in g.columns]
-    if exclude_first_stop_gap and group_cols:
-        sort_cols = group_cols + [c for c in ["activity_dt", "stop_order"] if c in g.columns]
-        g = g.sort_values(sort_cols)
-        first_idx = g.groupby(group_cols, dropna=False).head(1).index
-        g["is_first_customer_stop"] = False
-        g.loc[first_idx, "is_first_customer_stop"] = True
-    else:
-        g["is_first_customer_stop"] = False
-
-    base = g[~g["is_first_customer_stop"]].copy() if exclude_first_stop_gap else g.copy()
-    if base.empty:
-        return pd.DataFrame()
-
-    route_stats = (
-        base.groupby("route", dropna=False)["gap_minutes"]
-        .agg(route_gap_median="median", route_gap_p90=lambda s: float(s.quantile(0.90)))
-        .reset_index()
-    )
-    route_stats["route_gap_threshold"] = route_stats[["route_gap_p90", "route_gap_median"]].max(axis=1)
-    route_stats["route_gap_threshold"] = route_stats.apply(
-        lambda r: max(float(r["route_gap_p90"]), float(r["route_gap_median"]) * 2.0, float(floor_minutes)), axis=1
-    )
-
-    out = base.merge(route_stats, on="route", how="left")
-    out = out[out["gap_minutes"] >= out["route_gap_threshold"]].copy()
+    route_stats = hist_legs.groupby("route", dropna=False)["adjusted_gap_minutes"].agg(route_gap_median="median", route_gap_mean="mean", route_gap_count="count").reset_index()
+    p90 = hist_legs.groupby("route", dropna=False)["adjusted_gap_minutes"].quantile(0.90).reset_index(name="route_gap_p90")
+    route_stats = route_stats.merge(p90, on="route", how="left")
+    route_stats["route_gap_threshold"] = route_stats.apply(lambda r: max(float(r["route_gap_p90"]) if pd.notna(r["route_gap_p90"]) else 0.0, float(r["route_gap_median"]) * 2.0 if pd.notna(r["route_gap_median"]) else 0.0, float(floor_minutes)), axis=1)
+    out = cur_legs.merge(route_stats, on="route", how="left")
+    out["route_gap_threshold"] = out["route_gap_threshold"].fillna(float(floor_minutes))
+    out = out[out["adjusted_gap_minutes"] >= out["route_gap_threshold"]].copy()
     if out.empty:
-        return out
-
-    out["severity_ratio"] = out["gap_minutes"] / out["route_gap_threshold"]
-    out["severity_band"] = np.select(
-        [out["severity_ratio"] >= 2.0, out["severity_ratio"] >= 1.5, out["severity_ratio"] >= 1.2],
-        ["High", "Medium", "Watch"],
-        default="Watch",
-    )
-    out["explanation_note"] = np.where(
-        out.get("is_pickup_like", False),
-        "Pickup stop gap needs review",
-        "Customer stop gap needs review",
-    )
-    out = out.sort_values([c for c in ["scan_date", "route", "gap_minutes"] if c in out.columns], ascending=[True, True, False])
-    cols = [
-        "scan_date", "route", "fedex_id", "stop_order", "stop_type", "address", "activity_dt",
-        "gap_minutes", "route_gap_median", "route_gap_p90", "route_gap_threshold",
-        "severity_ratio", "severity_band", "is_first_customer_stop", "explanation_note",
-    ]
-    cols = [c for c in cols if c in out.columns]
-    return out[cols].reset_index(drop=True)
+        return pd.DataFrame()
+    out["severity_ratio"] = np.where(out["route_gap_threshold"] > 0, out["adjusted_gap_minutes"] / out["route_gap_threshold"], np.nan)
+    out["severity_band"] = np.select([out["severity_ratio"] >= 2.0, out["severity_ratio"] >= 1.5], ["High", "Medium"], default="Watch")
+    keep_cols = ["scan_date","route","courier_name","fedex_id","before_address","after_address","before_time","after_time","leg_elapsed_minutes","break_minutes_between","adjusted_gap_minutes","stop_type","route_gap_median","route_gap_p90","route_gap_threshold","severity_ratio","severity_band","gap_from_to","gap_time_window","source_file"]
+    keep_cols = [c for c in keep_cols if c in out.columns]
+    return out.sort_values([c for c in ["scan_date","route","severity_ratio","adjusted_gap_minutes"] if c in out.columns], ascending=[True,True,False,False])[keep_cols].reset_index(drop=True)

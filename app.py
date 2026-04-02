@@ -9,14 +9,17 @@ from utils_processing import (
     append_dedup,
     append_ingestion_log,
     append_or_replace_anchor_reference,
-    build_large_gap_exceptions,
-    build_route_performance_benchmarks,
+    build_courier_day_changes,
     build_ingestion_log_entries,
+    build_route_performance_benchmarks,
     build_route_day_summary,
+    build_large_gap_exceptions,
     consolidate_physical_pickups,
     cross_reference_stop_detail,
     ensure_data_dirs,
     enrich_gap_route_metrics_from_stops,
+    filter_to_our_workgroup,
+    is_relevant_workgroup_route,
     format_work_area_display,
     load_anchor_references,
     load_master_tables,
@@ -86,16 +89,6 @@ def _route_filter(df: pd.DataFrame, route_col: str, selected_routes) -> pd.DataF
     return df[df[route_col].astype(str).isin([str(x) for x in selected_routes])].copy()
 
 
-def _round_numeric(df: pd.DataFrame, decimals: int = 1) -> pd.DataFrame:
-    if df is None:
-        return df
-    out = df.copy()
-    num_cols = out.select_dtypes(include=["number"]).columns
-    if len(num_cols) > 0:
-        out[num_cols] = out[num_cols].round(decimals)
-    return out
-
-
 def _detect_file_type(file_obj) -> str:
     name = getattr(file_obj, "name", "").lower()
 
@@ -128,7 +121,10 @@ def _detect_file_type(file_obj) -> str:
 
     try:
         file_obj.seek(0)
-        preview_df = pd.read_excel(file_obj, nrows=5)
+        if name.endswith(".csv"):
+            preview_df = pd.read_csv(file_obj, nrows=5)
+        else:
+            preview_df = pd.read_excel(file_obj, nrows=5)
         cols = set(preview_df.columns.astype(str))
         if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
             file_obj.seek(0)
@@ -180,7 +176,7 @@ if page == "Update Master Data":
         st.subheader("Upload new source files")
         uploaded_files = st.file_uploader(
             "Upload GAP Excel, GAP saved HTML, pickup, and stop-detail files together",
-            type=["xlsx", "xls", "html", "htm"],
+            type=["xlsx", "xls", "csv", "html", "htm"],
             accept_multiple_files=True,
             key="mixed_uploads",
         )
@@ -398,50 +394,37 @@ elif page == "Analyze Existing Master":
     if gap_master.empty and pickup_stops_master.empty and stop_detail_master.empty and gap_route_metrics_master.empty:
         st.info("No master data available yet. Use Update Master Data first.")
     else:
-        def _is_our_route(val):
-            try:
-                r = int(float(val))
-            except Exception:
-                return False
-            return r in {482, 483, 488, 489, 924} or (702 <= r <= 799 and r != 721)
+        gap_master_wg = filter_to_our_workgroup(gap_master, "route") if not gap_master.empty and "route" in gap_master.columns else gap_master
+        pickup_stops_wg = filter_to_our_workgroup(pickup_stops_master, "route") if not pickup_stops_master.empty and "route" in pickup_stops_master.columns else pickup_stops_master
+        metrics_wg = filter_to_our_workgroup(gap_route_metrics_master, "route") if not gap_route_metrics_master.empty and "route" in gap_route_metrics_master.columns else gap_route_metrics_master
 
         route_values = []
-        for df, col in [(gap_master, "route"), (pickup_stops_master, "route"), (gap_route_metrics_master, "route")]:
-            if not df.empty and col in df.columns:
-                route_values.extend(pd.Series(df[col]).dropna().astype(str).tolist())
-        route_options = sorted({int(float(r)) for r in route_values if str(r).strip() not in {"", "nan"} and _is_our_route(r)})
+        for df, col in [(gap_master_wg, "route"), (pickup_stops_wg, "route"), (metrics_wg, "route")]:
+            if df is not None and not df.empty and col in df.columns:
+                route_values.extend(pd.to_numeric(df[col], errors="coerce").dropna().astype(int).tolist())
+        route_options = sorted({r for r in route_values if is_relevant_workgroup_route(r)})
 
         all_dates = []
-        for df, col in [
-            (gap_master, "scan_date"),
-            (pickup_stops_master, "pickup_date"),
-            (stop_detail_master, "scan_date"),
-            (gap_route_metrics_master, "scan_date"),
-        ]:
-            if not df.empty and col in df.columns:
+        for df, col in [(gap_master_wg, "scan_date"), (pickup_stops_wg, "pickup_date"), (stop_detail_master, "scan_date"), (metrics_wg, "scan_date")]:
+            if df is not None and not df.empty and col in df.columns:
                 vals = pd.to_datetime(df[col], errors="coerce").dropna()
                 if not vals.empty:
                     all_dates.extend(vals.dt.date.tolist())
-        if all_dates:
-            min_date, max_date = min(all_dates), max(all_dates)
-        else:
-            min_date = max_date = None
 
         c1, c2, c3 = st.columns(3)
         with c1:
             selected_routes = st.multiselect("Filter routes", options=route_options, default=[])
         with c2:
-            if min_date is not None:
+            if all_dates:
+                min_date, max_date = min(all_dates), max(all_dates)
                 date_range = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
             else:
                 date_range = None
         with c3:
             courier_options = []
-            courier_source = gap_route_metrics_master.copy()
-            if not courier_source.empty and "route" in courier_source.columns:
-                courier_source = courier_source[courier_source["route"].apply(_is_our_route)].copy()
-                if selected_routes:
-                    courier_source = courier_source[courier_source["route"].astype(str).isin([str(r) for r in selected_routes])].copy()
+            courier_source = metrics_wg.copy() if metrics_wg is not None else pd.DataFrame()
+            if selected_routes and not courier_source.empty and "route" in courier_source.columns:
+                courier_source = courier_source[courier_source["route"].astype(str).isin([str(r) for r in selected_routes])]
             if not courier_source.empty and "courier_name" in courier_source.columns:
                 courier_options = sorted([c for c in courier_source["courier_name"].dropna().astype(str).unique().tolist() if c.strip()])
             selected_couriers = st.multiselect("Filter couriers", options=courier_options, default=[])
@@ -454,102 +437,70 @@ elif page == "Analyze Existing Master":
             else:
                 start_date = end_date = date_range
 
-            gap_f = _date_range_filter(gap_master, "scan_date", start_date, end_date)
-            pickup_stops_f = _date_range_filter(pickup_stops_master, "pickup_date", start_date, end_date)
-            stop_detail_f = _date_range_filter(stop_detail_master, "scan_date", start_date, end_date)
-            metrics_f = _date_range_filter(gap_route_metrics_master, "scan_date", start_date, end_date)
-
-            gap_f = _route_filter(gap_f, "route", selected_routes)
-            pickup_stops_f = _route_filter(pickup_stops_f, "route", selected_routes)
-            stop_detail_f = _route_filter(stop_detail_f, "route_key", selected_routes)
-            metrics_f = _route_filter(metrics_f, "route", selected_routes)
+            gap_f = _route_filter(_date_range_filter(gap_master_wg, "scan_date", start_date, end_date), "route", selected_routes)
+            pickup_stops_f = _route_filter(_date_range_filter(pickup_stops_wg, "pickup_date", start_date, end_date), "route", selected_routes)
+            stop_detail_f = _route_filter(_date_range_filter(stop_detail_master, "scan_date", start_date, end_date), "route_key", selected_routes)
+            metrics_f = _route_filter(_date_range_filter(metrics_wg, "scan_date", start_date, end_date), "route", selected_routes)
 
             if selected_couriers and not metrics_f.empty and "courier_name" in metrics_f.columns:
                 metrics_f = metrics_f[metrics_f["courier_name"].astype(str).isin(selected_couriers)].copy()
                 if not gap_f.empty and "fedex_id" in gap_f.columns and "fedex_id" in metrics_f.columns:
                     gap_f = gap_f[gap_f["fedex_id"].astype(str).isin(metrics_f["fedex_id"].astype(str).unique())].copy()
 
-            with st.spinner("Building summaries..."):
-                route_day_summary = build_route_day_summary(gap_f, pickup_stops_f)
-                stop_detail_xref = cross_reference_stop_detail(stop_detail_f, gap_f, pickup_master) if not stop_detail_f.empty else pd.DataFrame()
-                route_performance_benchmarks = build_route_performance_benchmarks(metrics_f, gap_route_metrics_master)
-                large_gap_exceptions = build_large_gap_exceptions(gap_f, gap_master)
+            route_day_summary = build_route_day_summary(gap_f, pickup_stops_f)
+            route_bench = build_route_performance_benchmarks(metrics_f, metrics_wg) if not metrics_f.empty else pd.DataFrame()
+            large_gap_exceptions = build_large_gap_exceptions(gap_f, gap_master_wg) if not gap_f.empty else pd.DataFrame()
+
+            def _round_df(df):
+                if df is None or df.empty:
+                    return df
+                out = df.copy()
+                num_cols = out.select_dtypes(include=["number"]).columns
+                out[num_cols] = out[num_cols].round(1)
+                return out
+
+            metrics_show = _round_df(metrics_f)
+            route_bench_show = _round_df(route_bench)
+            large_gap_show = _round_df(large_gap_exceptions)
+            route_day_show = _round_df(route_day_summary)
 
             st.subheader("Courier day performance")
-            if metrics_f.empty:
+            if metrics_show.empty:
                 st.info("No GAP HTML courier metrics found in the current filter range yet.")
             else:
-                show_cols = [
-                    "scan_date", "route", "courier_name", "fedex_id", "total_stops_actual",
-                    "actual_sth_oa", "actual_sth_or", "actual_hr_oa_min", "actual_hr_or_min",
-                    "gap_sum_minutes_all", "gap_sum_minutes_customer", "customer_stop_count",
-                    "pickup_stop_count", "delivery_stop_count", "miles_on_road", "total_paid_hours_min",
-                    "source_file",
-                ]
-                show_cols = [c for c in show_cols if c in metrics_f.columns]
-                display_metrics = metrics_f.sort_values(["scan_date", "route", "courier_name"])[show_cols].copy()
-                num_cols = display_metrics.select_dtypes(include="number").columns
-                display_metrics[num_cols] = display_metrics[num_cols].round(1)
-                st.dataframe(display_metrics, use_container_width=True)
-
-                large_gap_count = 0 if large_gap_exceptions.empty else len(large_gap_exceptions)
+                show_cols = [c for c in ["scan_date", "route", "courier_name", "fedex_id", "total_stops_actual", "actual_sth_oa", "actual_sth_or", "actual_hr_oa_min", "actual_hr_or_min", "gap_sum_minutes_all", "gap_sum_minutes_customer", "customer_stop_count", "pickup_stop_count", "delivery_stop_count", "miles_on_road"] if c in metrics_show.columns]
+                st.dataframe(metrics_show.sort_values([c for c in ["scan_date", "route", "courier_name"] if c in metrics_show.columns])[show_cols], use_container_width=True)
                 k1, k2, k3, k4 = st.columns(4)
-                with k1:
-                    st.metric("Courier-day rows", len(metrics_f))
-                with k2:
-                    st.metric("Avg ST/H OA", round(float(metrics_f["actual_sth_oa"].dropna().mean()), 1) if "actual_sth_oa" in metrics_f.columns and metrics_f["actual_sth_oa"].notna().any() else "—")
-                with k3:
-                    st.metric("Avg ST/H OR", round(float(metrics_f["actual_sth_or"].dropna().mean()), 1) if "actual_sth_or" in metrics_f.columns and metrics_f["actual_sth_or"].notna().any() else "—")
-                with k4:
-                    st.metric("Large gap exceptions", large_gap_count)
+                k1.metric("Courier-day rows", len(metrics_show))
+                k2.metric("Avg ST/H OA", round(float(metrics_show["actual_sth_oa"].dropna().mean()), 1) if "actual_sth_oa" in metrics_show.columns and metrics_show["actual_sth_oa"].notna().any() else "—")
+                k3.metric("Avg ST/H OR", round(float(metrics_show["actual_sth_or"].dropna().mean()), 1) if "actual_sth_or" in metrics_show.columns and metrics_show["actual_sth_or"].notna().any() else "—")
+                k4.metric("Large gap exceptions", len(large_gap_show))
 
             st.subheader("Route performance benchmarks")
-            if route_performance_benchmarks.empty:
+            if route_bench_show.empty:
                 st.info("Not enough route-day rows to calculate route benchmarks yet.")
             else:
-                bench_display = route_performance_benchmarks.copy()
-                num_cols = bench_display.select_dtypes(include="number").columns
-                bench_display[num_cols] = bench_display[num_cols].round(1)
-                st.dataframe(bench_display, use_container_width=True)
-                st.download_button(
-                    "Download route_performance_benchmarks.csv",
-                    data=_csv_bytes(bench_display),
-                    file_name="route_performance_benchmarks.csv",
-                    mime="text/csv",
-                )
+                bench_cols = [c for c in ["scan_date","weekday","route","courier_name","fedex_id","actual_sth_oa","actual_sth_or","gap_sum_minutes_all","gap_sum_minutes_customer","total_stops_actual","overall_avg_sth_oa","overall_avg_sth_or","route_all_history_avg_sth_oa","route_all_history_avg_sth_or","route_prev_7_obs_avg_sth_oa","route_prev_7_obs_avg_sth_or","route_same_weekday_avg_sth_oa","route_same_weekday_avg_sth_or","delta_vs_route_all_history_oa","delta_vs_route_all_history_or","delta_vs_prev_7_obs_oa","delta_vs_prev_7_obs_or","delta_vs_same_weekday_oa","delta_vs_same_weekday_or"] if c in route_bench_show.columns]
+                st.dataframe(route_bench_show[bench_cols], use_container_width=True)
+                st.download_button("Download route_performance_benchmarks.csv", data=_csv_bytes(route_bench_show), file_name="route_performance_benchmarks.csv", mime="text/csv")
 
             st.subheader("Large gaps needing explanation")
-            if large_gap_exceptions.empty:
-                st.info("No large customer-stop gaps found for the current filters.")
+            if large_gap_show.empty:
+                st.info("No large customer-stop gaps for the current filters.")
             else:
-                gap_cols = [
-                    "scan_date", "route", "courier_name", "before_address", "after_address",
-                    "before_time", "after_time", "gap_minutes", "stop_type",
-                    "route_gap_median", "route_gap_p90", "route_gap_threshold", "severity_ratio", "severity_band",
-                ]
-                gap_cols = [c for c in gap_cols if c in large_gap_exceptions.columns]
-                gap_display = large_gap_exceptions[gap_cols].copy()
-                num_cols = gap_display.select_dtypes(include="number").columns
-                gap_display[num_cols] = gap_display[num_cols].round(1)
-                st.dataframe(gap_display, use_container_width=True)
-                st.download_button(
-                    "Download large_gap_exceptions.csv",
-                    data=_csv_bytes(gap_display),
-                    file_name="large_gap_exceptions.csv",
-                    mime="text/csv",
-                )
+                gap_cols = [c for c in ["scan_date","route","courier_name","before_address","after_address","before_time","after_time","leg_elapsed_minutes","break_minutes_between","adjusted_gap_minutes","stop_type","route_gap_median","route_gap_p90","route_gap_threshold","severity_ratio","severity_band"] if c in large_gap_show.columns]
+                st.dataframe(large_gap_show[gap_cols], use_container_width=True)
+                st.download_button("Download large_gap_exceptions.csv", data=_csv_bytes(large_gap_show), file_name="large_gap_exceptions.csv", mime="text/csv")
 
             st.subheader("Route-day summary")
-            if route_day_summary.empty:
-                st.info("No route-day summary available for the current filter.")
+            if route_day_show.empty:
+                st.info("No route-day summary available for the current filters.")
             else:
-                summary_display = route_day_summary.copy()
-                num_cols = summary_display.select_dtypes(include="number").columns
-                summary_display[num_cols] = summary_display[num_cols].round(1)
-                st.dataframe(summary_display, use_container_width=True)
-
+                st.dataframe(route_day_show, use_container_width=True)
+                st.download_button("Download route_day_summary.csv", data=_csv_bytes(route_day_show), file_name="route_day_summary.csv", mime="text/csv")
 
 elif page == "Settings / Exceptions":
+
     st.header("Settings / Exceptions")
 
     settings_path = Path(paths["base"]) / "route_exceptions.json"

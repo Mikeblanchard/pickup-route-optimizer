@@ -3,38 +3,37 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import utils_processing as up
 
-from utils_processing import (
-    APP_CONFIG,
-    append_dedup,
-    append_ingestion_log,
-    append_or_replace_anchor_reference,
-    build_courier_day_changes,
-    build_ingestion_log_entries,
-    build_route_performance_benchmarks,
-    build_route_day_summary,
-    build_large_gap_exceptions,
-    consolidate_physical_pickups,
-    cross_reference_stop_detail,
-    ensure_data_dirs,
-    enrich_gap_route_metrics_from_stops,
-    filter_to_our_workgroup,
-    is_relevant_workgroup_route,
-    format_work_area_display,
-    load_anchor_references,
-    load_master_tables,
-    match_pickups_to_gap,
-    normalize_work_area_key,
-    read_gap_html_file,
-    read_stop_detail_file,
-    read_uploaded_excels,
-    save_master_tables,
-    standardize_gap,
-    standardize_gap_html_stops,
-    standardize_gap_route_metrics,
-    standardize_pickups,
-    standardize_stop_detail,
-)
+APP_CONFIG = up.APP_CONFIG
+append_dedup = up.append_dedup
+append_ingestion_log = up.append_ingestion_log
+append_or_replace_anchor_reference = up.append_or_replace_anchor_reference
+build_courier_day_changes = up.build_courier_day_changes
+build_ingestion_log_entries = up.build_ingestion_log_entries
+build_route_performance_benchmarks = up.build_route_performance_benchmarks
+build_route_day_summary = up.build_route_day_summary
+build_large_gap_exceptions = up.build_large_gap_exceptions
+consolidate_physical_pickups = up.consolidate_physical_pickups
+cross_reference_stop_detail = up.cross_reference_stop_detail
+ensure_data_dirs = up.ensure_data_dirs
+enrich_gap_route_metrics_from_stops = up.enrich_gap_route_metrics_from_stops
+filter_to_our_workgroup = up.filter_to_our_workgroup
+is_relevant_workgroup_route = up.is_relevant_workgroup_route
+format_work_area_display = up.format_work_area_display
+load_anchor_references = up.load_anchor_references
+load_master_tables = up.load_master_tables
+match_pickups_to_gap = up.match_pickups_to_gap
+normalize_work_area_key = up.normalize_work_area_key
+read_gap_html_file = up.read_gap_html_file
+read_stop_detail_file = up.read_stop_detail_file
+read_uploaded_excels = up.read_uploaded_excels
+save_master_tables = up.save_master_tables
+standardize_gap = up.standardize_gap
+standardize_gap_html_stops = up.standardize_gap_html_stops
+standardize_gap_route_metrics = up.standardize_gap_route_metrics
+standardize_pickups = up.standardize_pickups
+standardize_stop_detail = up.standardize_stop_detail
 
 st.set_page_config(page_title="Pickup Route Optimizer", layout="wide")
 

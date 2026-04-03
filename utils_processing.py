@@ -15,7 +15,6 @@ APP_CONFIG = {
     "weekend_starts": {"Saturday": "08:15", "Sunday": "09:30"},
     "start_of_day_station_min": 30,
     "end_of_day_station_min": 15,
-    "pickup_match_tolerance_min": 10,
     "consolidation_time_tolerance_min": 5,
     "reason_code_map": {
         910: "Cancelled",
@@ -102,6 +101,20 @@ def save_master_tables(paths, gap_master, pickup_master, pickup_stops_master, st
     stop_detail_master.to_pickle(paths["master"] / "stop_detail_master.pkl")
     gap_route_metrics_master.to_pickle(paths["master"] / "gap_route_metrics_master.pkl")
     ingestion_log.to_csv(paths["master"] / "ingestion_log.csv", index=False)
+
+
+def rebuild_gap_metrics_from_master(gap_master: pd.DataFrame, gap_route_metrics_master: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Recompute / backfill courier-day GAP metrics from saved stop rows.
+
+    Derived values are preferred for:
+    - total_stops_actual (Stop Order count)
+    - actual_hr_oa_min
+    - actual_hr_or_min
+    - actual_sth_oa
+    - actual_sth_or
+    """
+    metrics_std = standardize_gap_route_metrics(gap_route_metrics_master) if gap_route_metrics_master is not None and not gap_route_metrics_master.empty else pd.DataFrame()
+    return enrich_gap_route_metrics_from_stops(metrics_std, gap_master)
 
 
 # -----------------------------
@@ -517,6 +530,10 @@ def consolidate_physical_pickups(p):
     if p.empty:
         return p.copy()
     df = p.copy()
+    if "source_file" not in df.columns:
+        df["source_file"] = ""
+    if "scanned_ground_acct" not in df.columns:
+        df["scanned_ground_acct"] = 1
     df["pickup_dt_floor"] = floor_dt_to_tolerance(df["pickup_dt"], APP_CONFIG["consolidation_time_tolerance_min"])
     df["ready_dt_floor"] = floor_dt_to_tolerance(df["ready_pickup_dt"], APP_CONFIG["consolidation_time_tolerance_min"])
     df["close_dt_floor"] = floor_dt_to_tolerance(df["close_pickup_dt"], APP_CONFIG["consolidation_time_tolerance_min"])
@@ -1417,18 +1434,19 @@ def _derive_route_metrics_from_stops(gap_stops_df: pd.DataFrame) -> pd.DataFrame
                 break_minutes += max((et - bt).total_seconds() / 60.0, 0.0)
                 remaining_end_breaks.remove(et)
 
-        total_stops_actual = float(len(customer)) if not customer.empty else 0.0
+        stop_order_numeric = pd.to_numeric(customer.get("stop_order"), errors="coerce") if not customer.empty else pd.Series(dtype=float)
+        total_stops_actual = float(stop_order_numeric.notna().sum()) if not customer.empty else 0.0
         cutoff_1030 = pd.Timestamp(pd.Timestamp(keys[0]).date()).replace(hour=10, minute=30) if pd.notna(keys[0]) else pd.NaT
         st_lt_1030_actual = float((customer["activity_dt"] <= cutoff_1030).sum()) if not customer.empty and pd.notna(cutoff_1030) else np.nan
         st_gt_1030_actual = float((customer["activity_dt"] > cutoff_1030).sum()) if not customer.empty and pd.notna(cutoff_1030) else np.nan
 
         hr_or_min = np.nan
         if pd.notna(leave_building_dt) and pd.notna(return_to_bldg_dt):
-            hr_or_min = max((return_to_bldg_dt - leave_building_dt).total_seconds() / 60.0 - break_minutes, 0.0)
+            hr_or_min = max((return_to_bldg_dt - leave_building_dt).total_seconds() / 60.0, 0.0)
 
         hr_oa_min = np.nan
         if pd.notna(on_area_start_dt) and pd.notna(on_area_end_dt):
-            hr_oa_min = max((on_area_end_dt - on_area_start_dt).total_seconds() / 60.0 - break_minutes, 0.0)
+            hr_oa_min = max((on_area_end_dt - on_area_start_dt).total_seconds() / 60.0, 0.0)
 
         hr_to_area_min = np.nan
         if pd.notna(leave_building_dt) and pd.notna(on_area_start_dt):
@@ -1618,8 +1636,11 @@ def enrich_gap_route_metrics_from_stops(gap_route_metrics_df, gap_stops_df):
                 "leave_building_dt", "on_area_start_dt", "on_area_end_dt", "return_to_bldg_dt",
                 "total_paid_hours_text", "total_paid_hours_min",
                 "actual_hr_oa_text", "actual_hr_or_text", "hr_to_area_text", "hr_from_area_text", "hr_break_or_text",
-                "actual_hr_oa_min", "actual_hr_or_min", "hr_to_area_min", "hr_from_area_min", "hr_break_or_min",
-                "actual_sth_oa", "actual_sth_or", "total_stops_actual", "st_lt_1030_actual", "st_gt_1030_actual",
+                "hr_to_area_min", "hr_from_area_min", "hr_break_or_min",
+                "st_lt_1030_actual", "st_gt_1030_actual",
+            ]
+            always_prefer_derived_cols = [
+                "actual_hr_oa_min", "actual_hr_or_min", "actual_sth_oa", "actual_sth_or", "total_stops_actual"
             ]
             for col in prefer_fill_cols:
                 drv_col = f"{col}_drv"
@@ -1628,6 +1649,12 @@ def enrich_gap_route_metrics_from_stops(gap_route_metrics_df, gap_stops_df):
                         out[col] = out[drv_col]
                     else:
                         out[col] = out[col].where(out[col].notna(), out[drv_col])
+                    out = out.drop(columns=[drv_col])
+
+            for col in always_prefer_derived_cols:
+                drv_col = f"{col}_drv"
+                if drv_col in out.columns:
+                    out[col] = out[drv_col]
                     out = out.drop(columns=[drv_col])
             extra_drv_cols = [c for c in out.columns if c.endswith("_drv")]
             if extra_drv_cols:
@@ -1788,3 +1815,636 @@ def build_large_gap_exceptions(gap_df, gap_history=None, floor_minutes=None, exc
     if floor_minutes is None:
         floor_minutes = float(APP_CONFIG.get("large_gap_internal_floor_min", 10.0))
     return _build_large_gap_exceptions_impl(gap_df, gap_history, floor_minutes, exclude_first_stop_gap)
+
+
+# -----------------------------
+# Cut Run Optimizer
+# -----------------------------
+def _minute_of_day_from_ts(ts):
+    ts = pd.to_datetime(ts, errors="coerce")
+    if pd.isna(ts):
+        return np.nan
+    return ts.hour * 60 + ts.minute + ts.second / 60.0
+
+
+def _mode_or_first(series):
+    s = pd.Series(series).dropna()
+    if s.empty:
+        return None
+    try:
+        m = s.mode(dropna=True)
+        if not m.empty:
+            return m.iloc[0]
+    except Exception:
+        pass
+    return s.iloc[0]
+
+
+def get_anchor_catalog(anchor_refs=None, pickup_stops_df=None):
+    rows = []
+    if pickup_stops_df is not None and not pickup_stops_df.empty:
+        p = pickup_stops_df.copy()
+        if "work_area_no" in p.columns:
+            for key, grp in p.groupby("work_area_no", dropna=True):
+                key_norm = normalize_work_area_key(key)
+                if key_norm is None:
+                    continue
+                rows.append({
+                    "anchor_key": key_norm,
+                    "anchor_display": format_work_area_display(key),
+                    "wave_label": _mode_or_first(grp.get("wave_label", pd.Series(dtype=object))),
+                    "anchor_source": "pickup_history",
+                })
+    if anchor_refs is not None and not anchor_refs.empty:
+        a = anchor_refs.copy()
+        if "work_area_key" in a.columns:
+            for _, r in a.iterrows():
+                key_norm = normalize_work_area_key(r.get("work_area_key"))
+                if key_norm is None:
+                    continue
+                rows.append({
+                    "anchor_key": key_norm,
+                    "anchor_display": format_work_area_display(key_norm),
+                    "wave_label": clean_text(r.get("wave")) if pd.notna(r.get("wave")) else None,
+                    "anchor_source": "anchor_reference",
+                })
+    if not rows:
+        return pd.DataFrame(columns=["anchor_key", "anchor_display", "wave_label", "anchor_source"])
+    out = pd.DataFrame(rows)
+    out = out.sort_values([c for c in ["anchor_key", "anchor_source"] if c in out.columns]).drop_duplicates(subset=["anchor_key"], keep="first")
+    return out.reset_index(drop=True)
+
+
+def build_pickup_anchor_history(pickup_stops_df, day_name=None):
+    if pickup_stops_df is None or pickup_stops_df.empty:
+        empty_daily = pd.DataFrame(columns=[
+            "pickup_date", "weekday", "route", "anchor_key", "anchor_display", "wave_label",
+            "pickup_stop_count", "package_count", "ready_min", "close_min", "pickup_min",
+            "account_count", "city", "postal_fsa"
+        ])
+        empty_summary = pd.DataFrame(columns=[
+            "route", "anchor_key", "anchor_display", "wave_label", "hist_days", "avg_pickup_stops",
+            "avg_packages", "median_close_min", "median_ready_min", "receiver_overlap_share", "cities"
+        ])
+        return empty_daily, empty_summary
+
+    p = pickup_stops_df.copy()
+    if "pickup_date" in p.columns:
+        p["pickup_date"] = pd.to_datetime(p["pickup_date"], errors="coerce")
+        p["weekday"] = p["pickup_date"].dt.day_name()
+    else:
+        p["weekday"] = None
+    if "wave_label" not in p.columns:
+        if "work_area" in p.columns and "pickup_date" in p.columns:
+            inferred = p.apply(lambda r: infer_wave_start(r.get("work_area"), r.get("pickup_date")), axis=1)
+            p["wave_label"] = [x[1] for x in inferred]
+        else:
+            p["wave_label"] = None
+    if day_name:
+        p = p[p["weekday"].astype(str).str.lower() == str(day_name).lower()].copy()
+    if p.empty:
+        return build_pickup_anchor_history(pd.DataFrame(columns=p.columns), None)
+
+    p["route"] = pd.to_numeric(p.get("route"), errors="coerce").astype("Int64")
+    p["anchor_key"] = p.get("work_area_no").apply(normalize_work_area_key) if "work_area_no" in p.columns else None
+    if "anchor_key" not in p.columns:
+        p["anchor_key"] = None
+    p["anchor_display"] = p["anchor_key"].apply(format_work_area_display)
+    p["ready_min"] = p.get("ready_pickup_dt", pd.Series(pd.NaT, index=p.index)).apply(_minute_of_day_from_ts)
+    p["close_min"] = p.get("close_pickup_dt", pd.Series(pd.NaT, index=p.index)).apply(_minute_of_day_from_ts)
+    p["pickup_min"] = p.get("pickup_dt", pd.Series(pd.NaT, index=p.index)).apply(_minute_of_day_from_ts)
+    p["package_count"] = pd.to_numeric(p.get("packages"), errors="coerce").fillna(0.0)
+    p["city"] = p.get("city", pd.Series("", index=p.index)).fillna("").astype(str)
+    p["postal_fsa"] = p.get("postal_code", pd.Series("", index=p.index)).fillna("").astype(str).str.replace(" ", "").str[:3]
+
+    daily = (
+        p.groupby(["pickup_date", "weekday", "route", "anchor_key", "anchor_display"], dropna=False)
+        .agg(
+            wave_label=("wave_label", _mode_or_first),
+            pickup_stop_count=("pickup_key", "nunique") if "pickup_key" in p.columns else ("address", "count"),
+            package_count=("package_count", "sum"),
+            ready_min=("ready_min", "median"),
+            close_min=("close_min", "median"),
+            pickup_min=("pickup_min", "median"),
+            account_count=("account_name", pd.Series.nunique) if "account_name" in p.columns else ("address", pd.Series.nunique),
+            city=("city", _mode_or_first),
+            postal_fsa=("postal_fsa", _mode_or_first),
+        )
+        .reset_index()
+    )
+
+    if daily.empty:
+        return daily, pd.DataFrame()
+
+    anchor_summary = (
+        daily.groupby(["route", "anchor_key", "anchor_display"], dropna=False)
+        .agg(
+            wave_label=("wave_label", _mode_or_first),
+            hist_days=("pickup_date", "nunique"),
+            avg_pickup_stops=("pickup_stop_count", "mean"),
+            avg_packages=("package_count", "mean"),
+            median_close_min=("close_min", "median"),
+            median_ready_min=("ready_min", "median"),
+            cities=("city", lambda s: " | ".join(sorted(set([x for x in s.dropna().astype(str) if x]))[:5])),
+            postal_fsa=("postal_fsa", _mode_or_first),
+        )
+        .reset_index()
+    )
+
+    anchor_totals = anchor_summary.groupby("anchor_key", dropna=False)["hist_days"].sum().reset_index(name="anchor_hist_days")
+    anchor_summary = anchor_summary.merge(anchor_totals, on="anchor_key", how="left")
+    anchor_summary["receiver_overlap_share"] = np.where(anchor_summary["anchor_hist_days"] > 0, anchor_summary["hist_days"] / anchor_summary["anchor_hist_days"], 0.0)
+    return daily, anchor_summary
+
+
+def build_route_baseline_profiles(gap_route_metrics_df, pickup_stops_df, day_name=None):
+    metrics = gap_route_metrics_df.copy() if gap_route_metrics_df is not None else pd.DataFrame()
+    if not metrics.empty:
+        metrics["scan_date"] = pd.to_datetime(metrics.get("scan_date"), errors="coerce")
+        metrics["weekday"] = metrics["scan_date"].dt.day_name()
+        if day_name:
+            metrics = metrics[metrics["weekday"].astype(str).str.lower() == str(day_name).lower()].copy()
+        metrics["route"] = pd.to_numeric(metrics.get("route"), errors="coerce").astype("Int64")
+        metrics["total_stops_actual"] = pd.to_numeric(metrics.get("total_stops_actual"), errors="coerce")
+        metrics["actual_hr_or_min"] = pd.to_numeric(metrics.get("actual_hr_or_min"), errors="coerce")
+        metrics["actual_hr_oa_min"] = pd.to_numeric(metrics.get("actual_hr_oa_min"), errors="coerce")
+        metrics["actual_sth_or"] = pd.to_numeric(metrics.get("actual_sth_or"), errors="coerce")
+        metrics["actual_sth_oa"] = pd.to_numeric(metrics.get("actual_sth_oa"), errors="coerce")
+        metrics["packages_proxy"] = pd.to_numeric(metrics.get("delivery_stop_count"), errors="coerce")
+        base_metrics = (
+            metrics.groupby("route", dropna=False)
+            .agg(
+                hist_days=("scan_date", "nunique"),
+                avg_total_stops=("total_stops_actual", "mean"),
+                avg_hr_or_min=("actual_hr_or_min", "mean"),
+                avg_hr_oa_min=("actual_hr_oa_min", "mean"),
+                avg_sth_or=("actual_sth_or", "mean"),
+                avg_sth_oa=("actual_sth_oa", "mean"),
+                avg_gap_customer=("gap_sum_minutes_customer", "mean") if "gap_sum_minutes_customer" in metrics.columns else ("actual_hr_or_min", lambda s: np.nan),
+                median_return_min=("return_to_bldg_dt", lambda s: np.nanmedian([_minute_of_day_from_ts(x) for x in s]) if len(s) else np.nan),
+                median_on_area_end_min=("on_area_end_dt", lambda s: np.nanmedian([_minute_of_day_from_ts(x) for x in s]) if len(s) else np.nan),
+            )
+            .reset_index()
+        )
+    else:
+        base_metrics = pd.DataFrame(columns=["route", "hist_days", "avg_total_stops", "avg_hr_or_min", "avg_hr_oa_min", "avg_sth_or", "avg_sth_oa", "avg_gap_customer", "median_return_min", "median_on_area_end_min"])
+
+    daily_anchor, anchor_summary = build_pickup_anchor_history(pickup_stops_df, day_name=day_name)
+    if not daily_anchor.empty:
+        pickup_route = (
+            daily_anchor.groupby("route", dropna=False)
+            .agg(
+                avg_pickup_stops=("pickup_stop_count", "mean"),
+                avg_pickup_packages=("package_count", "mean"),
+                avg_anchor_count=("anchor_key", pd.Series.nunique),
+                dominant_wave=("wave_label", _mode_or_first),
+                median_close_min=("close_min", "median"),
+            )
+            .reset_index()
+        )
+    else:
+        pickup_route = pd.DataFrame(columns=["route", "avg_pickup_stops", "avg_pickup_packages", "avg_anchor_count", "dominant_wave", "median_close_min"])
+
+    if base_metrics.empty and pickup_route.empty:
+        return pd.DataFrame(), daily_anchor, anchor_summary
+
+    profiles = pd.merge(base_metrics, pickup_route, on="route", how="outer")
+    profiles["route"] = pd.to_numeric(profiles.get("route"), errors="coerce").astype("Int64")
+    profiles = filter_to_our_workgroup(profiles, "route") if not profiles.empty else profiles
+    profiles["avg_minutes_per_stop"] = np.where(
+        profiles.get("avg_total_stops", pd.Series(dtype=float)).fillna(0) > 0,
+        profiles.get("avg_hr_or_min", pd.Series(dtype=float)) / profiles.get("avg_total_stops", pd.Series(dtype=float)),
+        np.nan,
+    )
+    profiles["avg_minutes_per_pickup_stop"] = np.where(
+        profiles.get("avg_pickup_stops", pd.Series(dtype=float)).fillna(0) > 0,
+        profiles.get("avg_hr_or_min", pd.Series(dtype=float)) / profiles.get("avg_pickup_stops", pd.Series(dtype=float)),
+        profiles.get("avg_minutes_per_stop", pd.Series(dtype=float)),
+    )
+    return profiles.reset_index(drop=True), daily_anchor, anchor_summary
+
+
+def get_strategy_weights(preset="Balanced", overrides=None):
+    presets = {
+        "Balanced": {
+            "pickup_safety": 0.30,
+            "added_time": 0.23,
+            "proximity": 0.18,
+            "stop_density": 0.12,
+            "package_burden": 0.10,
+            "fragmentation": 0.07,
+        },
+        "Pickup Safe": {
+            "pickup_safety": 0.40,
+            "added_time": 0.18,
+            "proximity": 0.16,
+            "stop_density": 0.10,
+            "package_burden": 0.10,
+            "fragmentation": 0.06,
+        },
+        "Shortest Added Drive": {
+            "pickup_safety": 0.24,
+            "added_time": 0.34,
+            "proximity": 0.22,
+            "stop_density": 0.08,
+            "package_burden": 0.07,
+            "fragmentation": 0.05,
+        },
+        "Highest Density": {
+            "pickup_safety": 0.24,
+            "added_time": 0.18,
+            "proximity": 0.15,
+            "stop_density": 0.24,
+            "package_burden": 0.11,
+            "fragmentation": 0.08,
+        },
+    }
+    weights = presets.get(preset, presets["Balanced"]).copy()
+    if overrides:
+        for k, v in overrides.items():
+            if k in weights:
+                weights[k] = float(v)
+    total = sum(max(v, 0.0) for v in weights.values())
+    if total <= 0:
+        return presets["Balanced"]
+    return {k: max(v, 0.0) / total for k, v in weights.items()}
+
+
+def _normalize_scores(arr, higher_is_better=True):
+    s = pd.Series(arr, dtype="float64")
+    if s.empty:
+        return s
+    valid = s.dropna()
+    if valid.empty or valid.nunique() <= 1:
+        out = pd.Series(0.5, index=s.index, dtype="float64")
+        out[s.isna()] = np.nan
+        return out
+    lo, hi = valid.min(), valid.max()
+    scaled = (s - lo) / (hi - lo)
+    if not higher_is_better:
+        scaled = 1 - scaled
+    return scaled.clip(0, 1)
+
+
+def _close_time_risk(anchor_close_min, receiver_wave, overlap_share, receiver_end_min):
+    risk = 0.0
+    disqualify = False
+    if pd.notna(anchor_close_min):
+        if str(receiver_wave).upper() == "W2":
+            if anchor_close_min < 13 * 60:
+                risk += 1.0
+                disqualify = True
+            elif anchor_close_min < 14 * 60 and (pd.isna(overlap_share) or overlap_share < 0.20):
+                risk += 0.8
+        if pd.notna(receiver_end_min) and receiver_end_min > anchor_close_min and (pd.isna(overlap_share) or overlap_share < 0.20):
+            risk += 0.7
+            if receiver_end_min - anchor_close_min > 60:
+                disqualify = True
+    return min(risk, 1.5), disqualify
+
+
+def simulate_cut_route_plan(
+    cut_route,
+    route_profiles,
+    anchor_summary,
+    day_name=None,
+    candidate_routes=None,
+    include_anchors=None,
+    prioritize_anchors=None,
+    exclude_anchors=None,
+    weights=None,
+    package_soft_warning=400.0,
+):
+    cut_route = int(cut_route)
+    include_set = {normalize_work_area_key(x) for x in (include_anchors or []) if normalize_work_area_key(x) is not None}
+    prioritize_set = {normalize_work_area_key(x) for x in (prioritize_anchors or []) if normalize_work_area_key(x) is not None}
+    exclude_set = {normalize_work_area_key(x) for x in (exclude_anchors or []) if normalize_work_area_key(x) is not None}
+    if weights is None:
+        weights = get_strategy_weights()
+
+    rp = route_profiles.copy() if route_profiles is not None else pd.DataFrame()
+    if rp.empty or anchor_summary is None or anchor_summary.empty:
+        return {
+            "cut_route": cut_route,
+            "feasible": False,
+            "overall_score": np.nan,
+            "message": "Not enough route profile or pickup anchor history to simulate a cut plan.",
+            "assignment_plan": pd.DataFrame(),
+            "receiver_summary": pd.DataFrame(),
+            "cut_route_summary": pd.DataFrame(),
+            "scorecard": pd.DataFrame(),
+        }
+
+    rp["route"] = pd.to_numeric(rp.get("route"), errors="coerce").astype("Int64")
+    scope_routes = sorted({int(r) for r in rp["route"].dropna().astype(int).tolist() if int(r) != cut_route})
+    if candidate_routes:
+        scope_routes = [int(r) for r in scope_routes if int(r) in {int(x) for x in candidate_routes} and int(r) != cut_route]
+    if not scope_routes:
+        return {
+            "cut_route": cut_route,
+            "feasible": False,
+            "overall_score": np.nan,
+            "message": "No receiving routes available inside the selected scope.",
+            "assignment_plan": pd.DataFrame(),
+            "receiver_summary": pd.DataFrame(),
+            "cut_route_summary": pd.DataFrame(),
+            "scorecard": pd.DataFrame(),
+        }
+
+    cut_profile = rp[rp["route"] == cut_route].copy()
+    cut_prof = cut_profile.iloc[0].to_dict() if not cut_profile.empty else {"route": cut_route}
+
+    anchor_df = anchor_summary.copy()
+    anchor_df["route"] = pd.to_numeric(anchor_df.get("route"), errors="coerce").astype("Int64")
+    anchor_df = anchor_df[anchor_df["route"] == cut_route].copy()
+    if include_set:
+        anchor_df = anchor_df[anchor_df["anchor_key"].isin(include_set)].copy()
+    if exclude_set:
+        anchor_df = anchor_df[~anchor_df["anchor_key"].isin(exclude_set)].copy()
+    if anchor_df.empty:
+        return {
+            "cut_route": cut_route,
+            "feasible": False,
+            "overall_score": np.nan,
+            "message": "No matching anchor slices found for the selected cut route and filters.",
+            "assignment_plan": pd.DataFrame(),
+            "receiver_summary": pd.DataFrame(),
+            "cut_route_summary": pd.DataFrame([cut_prof]),
+            "scorecard": pd.DataFrame(),
+        }
+
+    route_lookup = rp.set_index("route", drop=False).to_dict("index")
+    assignments = []
+    receiver_loads = {r: {"added_stops": 0.0, "added_packages": 0.0, "added_minutes": 0.0, "anchor_count": 0} for r in scope_routes}
+
+    anchor_df["_is_prioritized_anchor"] = anchor_df["anchor_key"].isin(prioritize_set)
+    anchor_df = anchor_df.sort_values(["_is_prioritized_anchor", "avg_pickup_stops"], ascending=[False, False]).reset_index(drop=True)
+
+    for _, a in anchor_df.iterrows():
+        cand_rows = []
+        for rr in scope_routes:
+            rec = route_lookup.get(rr, {})
+            hist_match = anchor_summary[(anchor_summary["anchor_key"] == a.get("anchor_key")) & (anchor_summary["route"] == rr)]
+            overlap_share = float(hist_match["receiver_overlap_share"].iloc[0]) if not hist_match.empty and pd.notna(hist_match["receiver_overlap_share"].iloc[0]) else 0.0
+            receiver_wave = rec.get("dominant_wave") or (hist_match["wave_label"].iloc[0] if not hist_match.empty else None)
+            route_distance = abs(int(rr) - int(cut_route))
+            proximity_raw = (0.65 * overlap_share) + (0.20 if str(receiver_wave) == str(a.get("wave_label")) and pd.notna(a.get("wave_label")) else 0.0) + (0.15 * (1.0 / (1.0 + route_distance)))
+            mins_per_stop = rec.get("avg_minutes_per_pickup_stop")
+            if pd.isna(mins_per_stop) or mins_per_stop <= 0:
+                mins_per_stop = rec.get("avg_minutes_per_stop")
+            if pd.isna(mins_per_stop) or mins_per_stop <= 0:
+                mins_per_stop = cut_prof.get("avg_minutes_per_pickup_stop")
+            if pd.isna(mins_per_stop) or mins_per_stop <= 0:
+                mins_per_stop = 6.0
+            added_stops = float(a.get("avg_pickup_stops") or 0.0)
+            added_packages = float(a.get("avg_packages") or 0.0)
+            added_minutes = added_stops * float(mins_per_stop)
+
+            projected_stops = float(rec.get("avg_total_stops") or 0.0) + receiver_loads[rr]["added_stops"] + added_stops
+            projected_minutes = float(rec.get("avg_hr_or_min") or 0.0) + receiver_loads[rr]["added_minutes"] + added_minutes
+            projected_packages = float(rec.get("avg_pickup_packages") or 0.0) + receiver_loads[rr]["added_packages"] + added_packages
+            projected_sth = projected_stops / (projected_minutes / 60.0) if projected_minutes > 0 else np.nan
+            density_gain = projected_sth - float(rec.get("avg_sth_or") or 0.0) if pd.notna(projected_sth) else 0.0
+
+            risk_value, disqualify = _close_time_risk(a.get("median_close_min"), receiver_wave, overlap_share, rec.get("median_on_area_end_min"))
+            package_warning = projected_packages > float(package_soft_warning)
+
+            cand_rows.append({
+                "receiver_route": rr,
+                "receiver_wave": receiver_wave,
+                "overlap_share": overlap_share,
+                "proximity_raw": proximity_raw,
+                "added_stops": added_stops,
+                "added_packages": added_packages,
+                "added_minutes": added_minutes,
+                "projected_stops": projected_stops,
+                "projected_minutes": projected_minutes,
+                "projected_packages": projected_packages,
+                "projected_sth_or": projected_sth,
+                "density_gain": density_gain,
+                "pickup_risk_raw": risk_value,
+                "disqualify": disqualify,
+                "package_warning": package_warning,
+            })
+
+        cand = pd.DataFrame(cand_rows)
+        cand["pickup_safety_score"] = _normalize_scores(1 - cand["pickup_risk_raw"], higher_is_better=True)
+        cand["added_time_score"] = _normalize_scores(cand["added_minutes"], higher_is_better=False)
+        cand["proximity_score"] = _normalize_scores(cand["proximity_raw"], higher_is_better=True)
+        cand["stop_density_score"] = _normalize_scores(cand["density_gain"], higher_is_better=True)
+        cand["package_burden_score"] = _normalize_scores(cand["projected_packages"], higher_is_better=False)
+        frag_value = 1.0 / (1.0 + pd.Series(range(len(cand)), index=cand.index, dtype="float64"))
+        cand["fragmentation_score"] = frag_value
+        cand["weighted_score"] = (
+            weights["pickup_safety"] * cand["pickup_safety_score"].fillna(0) +
+            weights["added_time"] * cand["added_time_score"].fillna(0) +
+            weights["proximity"] * cand["proximity_score"].fillna(0) +
+            weights["stop_density"] * cand["stop_density_score"].fillna(0) +
+            weights["package_burden"] * cand["package_burden_score"].fillna(0) +
+            weights["fragmentation"] * cand["fragmentation_score"].fillna(0)
+        )
+        cand = cand.sort_values(["disqualify", "weighted_score", "added_minutes"], ascending=[True, False, True]).reset_index(drop=True)
+        best = cand.iloc[0].to_dict()
+        receiver_loads[int(best["receiver_route"])] ["added_stops"] += float(best["added_stops"])
+        receiver_loads[int(best["receiver_route"])] ["added_packages"] += float(best["added_packages"])
+        receiver_loads[int(best["receiver_route"])] ["added_minutes"] += float(best["added_minutes"])
+        receiver_loads[int(best["receiver_route"])] ["anchor_count"] += 1
+        assignments.append({
+            "cut_route": cut_route,
+            "anchor_key": a.get("anchor_key"),
+            "anchor_display": a.get("anchor_display"),
+            "anchor_wave": a.get("wave_label"),
+            "anchor_hist_days": a.get("hist_days"),
+            "avg_pickup_stops": a.get("avg_pickup_stops"),
+            "avg_packages": a.get("avg_packages"),
+            "median_close_min": a.get("median_close_min"),
+            "prioritized_anchor": a.get("anchor_key") in prioritize_set,
+            **best,
+        })
+
+    assignment_df = pd.DataFrame(assignments)
+    if assignment_df.empty:
+        return {
+            "cut_route": cut_route,
+            "feasible": False,
+            "overall_score": np.nan,
+            "message": "No assignment candidates could be built.",
+            "assignment_plan": pd.DataFrame(),
+            "receiver_summary": pd.DataFrame(),
+            "cut_route_summary": pd.DataFrame([cut_prof]),
+            "scorecard": pd.DataFrame(),
+        }
+
+    feasible = not assignment_df["disqualify"].fillna(False).any()
+    receiver_rows = []
+    for rr, load in receiver_loads.items():
+        if load["anchor_count"] <= 0:
+            continue
+        rec = route_lookup.get(rr, {})
+        base_stops = float(rec.get("avg_total_stops") or 0.0)
+        base_minutes = float(rec.get("avg_hr_or_min") or 0.0)
+        base_packages = float(rec.get("avg_pickup_packages") or 0.0)
+        new_stops = base_stops + load["added_stops"]
+        new_minutes = base_minutes + load["added_minutes"]
+        new_packages = base_packages + load["added_packages"]
+        new_sth = new_stops / (new_minutes / 60.0) if new_minutes > 0 else np.nan
+        receiver_rows.append({
+            "receiver_route": rr,
+            "receiver_wave": rec.get("dominant_wave"),
+            "base_avg_stops": base_stops,
+            "base_avg_hr_or_min": base_minutes,
+            "base_avg_packages": base_packages,
+            "added_stops": load["added_stops"],
+            "added_minutes": load["added_minutes"],
+            "added_packages": load["added_packages"],
+            "new_avg_stops": new_stops,
+            "new_avg_hr_or_min": new_minutes,
+            "new_avg_sth_or": new_sth,
+            "new_avg_packages": new_packages,
+            "package_soft_warning": new_packages > float(package_soft_warning),
+            "assigned_anchor_count": load["anchor_count"],
+        })
+    receiver_summary = pd.DataFrame(receiver_rows).sort_values("added_minutes", ascending=False).reset_index(drop=True)
+
+    scorecard = pd.DataFrame([{
+        "cut_route": cut_route,
+        "feasible": feasible,
+        "overall_score": float(assignment_df["weighted_score"].mean() * 100.0),
+        "anchors_reassigned": len(assignment_df),
+        "receiving_routes_used": assignment_df["receiver_route"].nunique(),
+        "total_added_stops": float(assignment_df["added_stops"].sum()),
+        "total_added_packages": float(assignment_df["added_packages"].sum()),
+        "total_added_minutes": float(assignment_df["added_minutes"].sum()),
+        "pickup_risk_flags": int(assignment_df["disqualify"].fillna(False).sum()),
+        "package_soft_warnings": int(receiver_summary["package_soft_warning"].fillna(False).sum()) if not receiver_summary.empty else 0,
+    }])
+
+    cut_route_summary = pd.DataFrame([{
+        "cut_route": cut_route,
+        "avg_total_stops": cut_prof.get("avg_total_stops"),
+        "avg_hr_or_min": cut_prof.get("avg_hr_or_min"),
+        "avg_hr_oa_min": cut_prof.get("avg_hr_oa_min"),
+        "avg_sth_or": cut_prof.get("avg_sth_or"),
+        "avg_sth_oa": cut_prof.get("avg_sth_oa"),
+        "avg_pickup_stops": cut_prof.get("avg_pickup_stops"),
+        "avg_pickup_packages": cut_prof.get("avg_pickup_packages"),
+        "dominant_wave": cut_prof.get("dominant_wave"),
+        "hist_days": cut_prof.get("hist_days"),
+    }])
+
+    return {
+        "cut_route": cut_route,
+        "feasible": feasible,
+        "overall_score": float(scorecard["overall_score"].iloc[0]),
+        "message": "Plan built successfully." if feasible else "Plan built, but at least one assigned anchor raised a pickup-safety disqualifier.",
+        "assignment_plan": assignment_df.sort_values(["prioritized_anchor", "weighted_score", "added_minutes"], ascending=[False, False, True]).reset_index(drop=True),
+        "receiver_summary": receiver_summary,
+        "cut_route_summary": cut_route_summary,
+        "scorecard": scorecard,
+    }
+
+
+def build_cut_run_optimizer(
+    gap_route_metrics_df,
+    pickup_stops_df,
+    anchor_refs=None,
+    day_name=None,
+    mode="test_selected_route",
+    cut_route=None,
+    candidate_routes=None,
+    include_anchors=None,
+    prioritize_anchors=None,
+    exclude_anchors=None,
+    strategy_preset="Balanced",
+    strategy_overrides=None,
+    package_soft_warning=400.0,
+):
+    route_profiles, anchor_daily, anchor_summary = build_route_baseline_profiles(gap_route_metrics_df, pickup_stops_df, day_name=day_name)
+    anchor_catalog = get_anchor_catalog(anchor_refs=anchor_refs, pickup_stops_df=pickup_stops_df)
+    weights = get_strategy_weights(strategy_preset, strategy_overrides)
+
+    route_profiles = filter_to_our_workgroup(route_profiles, "route") if not route_profiles.empty else route_profiles
+    if candidate_routes:
+        candidate_routes = sorted({int(r) for r in candidate_routes if is_relevant_workgroup_route(r)})
+    else:
+        candidate_routes = sorted({int(r) for r in route_profiles.get("route", pd.Series(dtype="Int64")).dropna().astype(int).tolist()})
+
+    if cut_route is not None:
+        plans = [simulate_cut_route_plan(
+            cut_route=int(cut_route),
+            route_profiles=route_profiles,
+            anchor_summary=anchor_summary,
+            day_name=day_name,
+            candidate_routes=candidate_routes,
+            include_anchors=include_anchors,
+            prioritize_anchors=prioritize_anchors,
+            exclude_anchors=exclude_anchors,
+            weights=weights,
+            package_soft_warning=package_soft_warning,
+        )]
+    else:
+        plans = []
+
+    suggestions = []
+    if mode == "suggest_best_route" or cut_route is None:
+        for r in candidate_routes:
+            plan = simulate_cut_route_plan(
+                cut_route=int(r),
+                route_profiles=route_profiles,
+                anchor_summary=anchor_summary,
+                day_name=day_name,
+                candidate_routes=[x for x in candidate_routes if int(x) != int(r)],
+                include_anchors=include_anchors,
+                prioritize_anchors=prioritize_anchors,
+                exclude_anchors=exclude_anchors,
+                weights=weights,
+                package_soft_warning=package_soft_warning,
+            )
+            suggestions.append({
+                "cut_route": int(r),
+                "feasible": plan.get("feasible"),
+                "overall_score": plan.get("overall_score"),
+                "anchors_reassigned": plan.get("scorecard", pd.DataFrame()).get("anchors_reassigned", pd.Series([np.nan])).iloc[0] if isinstance(plan.get("scorecard"), pd.DataFrame) and not plan.get("scorecard").empty else np.nan,
+                "receiving_routes_used": plan.get("scorecard", pd.DataFrame()).get("receiving_routes_used", pd.Series([np.nan])).iloc[0] if isinstance(plan.get("scorecard"), pd.DataFrame) and not plan.get("scorecard").empty else np.nan,
+                "total_added_minutes": plan.get("scorecard", pd.DataFrame()).get("total_added_minutes", pd.Series([np.nan])).iloc[0] if isinstance(plan.get("scorecard"), pd.DataFrame) and not plan.get("scorecard").empty else np.nan,
+                "pickup_risk_flags": plan.get("scorecard", pd.DataFrame()).get("pickup_risk_flags", pd.Series([np.nan])).iloc[0] if isinstance(plan.get("scorecard"), pd.DataFrame) and not plan.get("scorecard").empty else np.nan,
+                "message": plan.get("message"),
+            })
+            if cut_route is not None and int(r) == int(cut_route):
+                plans = [plan]
+
+    suggestions_df = pd.DataFrame(suggestions)
+    if not suggestions_df.empty:
+        suggestions_df = suggestions_df.sort_values(["feasible", "overall_score", "total_added_minutes"], ascending=[False, False, True]).reset_index(drop=True)
+
+    selected_plan = plans[0] if plans else (simulate_cut_route_plan(
+        cut_route=int(suggestions_df.iloc[0]["cut_route"]),
+        route_profiles=route_profiles,
+        anchor_summary=anchor_summary,
+        day_name=day_name,
+        candidate_routes=[x for x in candidate_routes if int(x) != int(suggestions_df.iloc[0]["cut_route"])],
+        include_anchors=include_anchors,
+        prioritize_anchors=prioritize_anchors,
+        exclude_anchors=exclude_anchors,
+        weights=weights,
+        package_soft_warning=package_soft_warning,
+    ) if not suggestions_df.empty else {
+        "cut_route": None,
+        "feasible": False,
+        "overall_score": np.nan,
+        "message": "No routes available for cut analysis.",
+        "assignment_plan": pd.DataFrame(),
+        "receiver_summary": pd.DataFrame(),
+        "cut_route_summary": pd.DataFrame(),
+        "scorecard": pd.DataFrame(),
+    })
+
+    return {
+        "route_profiles": route_profiles,
+        "anchor_catalog": anchor_catalog,
+        "anchor_daily": anchor_daily,
+        "anchor_summary": anchor_summary,
+        "suggestions": suggestions_df,
+        "selected_plan": selected_plan,
+        "weights": pd.DataFrame([weights]),
+    }

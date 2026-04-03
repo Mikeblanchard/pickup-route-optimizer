@@ -9,13 +9,14 @@ import utils_processing as up
 st.set_page_config(page_title="Pickup Route Optimizer", layout="wide")
 
 st.title("Pickup Route Optimizer")
-st.caption("Recent route and pickup analysis for your workgroup.")
+st.caption("Recent route and pickup analysis for your workgroup, plus route-cut planning.")
 
 page = st.sidebar.radio(
     "Navigation",
     [
         "Update Master Data",
         "Analyze Existing Master",
+        "Cut Run Optimizer",
         "Settings / Exceptions",
     ],
 )
@@ -37,6 +38,8 @@ storage_root = st.sidebar.text_input(
 paths = up.ensure_data_dirs(storage_root)
 
 gap_master, pickup_master, pickup_stops_master, stop_detail_master, gap_route_metrics_master, ingestion_log = up.load_master_tables(paths)
+if not gap_master.empty:
+    gap_route_metrics_master = up.rebuild_gap_metrics_from_master(gap_master, gap_route_metrics_master)
 anchor_refs = up.load_anchor_references(paths)
 
 
@@ -80,8 +83,9 @@ def _detect_file_type(file_obj) -> str:
     except Exception:
         head_text = ""
 
-    if name.endswith((".html", ".htm")) and "gap reports for" in head_text:
-        return "gap_html"
+    if name.endswith((".html", ".htm")):
+        if "gap reports for" in head_text and ("total paid hrs" in head_text or "route:" in head_text):
+            return "gap_html"
 
     try:
         file_obj.seek(0)
@@ -101,7 +105,10 @@ def _detect_file_type(file_obj) -> str:
 
     try:
         file_obj.seek(0)
-        preview_df = pd.read_csv(file_obj, nrows=5) if name.endswith(".csv") else pd.read_excel(file_obj, nrows=5)
+        if name.endswith(".csv"):
+            preview_df = pd.read_csv(file_obj, nrows=5)
+        else:
+            preview_df = pd.read_excel(file_obj, nrows=5)
         cols = set(preview_df.columns.astype(str))
         if {"Scan Date", "Route", "Stop Order", "Stop Type", "Activity"}.issubset(cols):
             file_obj.seek(0)
@@ -270,6 +277,10 @@ if page == "Update Master Data":
                     gap_route_metrics_new,
                     key_cols=["scan_date", "route", "fedex_id"],
                 )
+                gap_route_metrics_master_updated = up.rebuild_gap_metrics_from_master(
+                    gap_master_updated,
+                    gap_route_metrics_master_updated,
+                )
                 log_new = up.build_ingestion_log_entries(gap_excel_files, pickup_files, stop_detail_files, gap_html_files)
                 ingestion_log_updated = up.append_ingestion_log(ingestion_log, log_new)
 
@@ -413,9 +424,174 @@ elif page == "Analyze Existing Master":
                 st.dataframe(route_day_show, use_container_width=True)
                 st.download_button("Download route_day_summary.csv", data=_csv_bytes(route_day_show), file_name="route_day_summary.csv", mime="text/csv")
 
+elif page == "Cut Run Optimizer":
+    st.header("Cut Run Optimizer")
+    st.caption("Additive planning page. Existing GAP analysis remains unchanged.")
+
+    if gap_route_metrics_master.empty and pickup_stops_master.empty:
+        st.info("No master data available yet. Load GAP HTML and pickup history first.")
+    else:
+        metrics_wg = up.filter_to_our_workgroup(gap_route_metrics_master, "route") if not gap_route_metrics_master.empty and "route" in gap_route_metrics_master.columns else gap_route_metrics_master
+        pickup_stops_wg = up.filter_to_our_workgroup(pickup_stops_master, "route") if not pickup_stops_master.empty and "route" in pickup_stops_master.columns else pickup_stops_master
+        route_profiles_all, _, _ = up.build_route_baseline_profiles(metrics_wg, pickup_stops_wg, day_name=None)
+        route_options = sorted({int(r) for r in route_profiles_all.get("route", pd.Series(dtype="Int64")).dropna().astype(int).tolist() if up.is_relevant_workgroup_route(r)})
+        anchor_catalog = up.get_anchor_catalog(anchor_refs=anchor_refs, pickup_stops_df=pickup_stops_wg)
+        anchor_options = anchor_catalog["anchor_key"].dropna().astype(str).tolist() if not anchor_catalog.empty else []
+        anchor_display_map = dict(zip(anchor_catalog.get("anchor_key", pd.Series(dtype=str)).astype(str), anchor_catalog.get("anchor_display", pd.Series(dtype=str)).astype(str)))
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            day_name = st.selectbox("Day of week", options=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], index=4)
+            mode_label = st.radio("Mode", options=["Test selected route", "Suggest best route to cut"], horizontal=False)
+            mode = "test_selected_route" if mode_label == "Test selected route" else "suggest_best_route"
+        with c2:
+            scope_mode = st.radio("Candidate scope", options=["Entire workgroup", "Chosen subset"], horizontal=False)
+            scope_routes = route_options
+            if scope_mode == "Chosen subset":
+                scope_routes = st.multiselect("Subset routes", options=route_options, default=route_options)
+            test_route = st.selectbox("Route to test", options=route_options, index=0 if route_options else None) if route_options else None
+        with c3:
+            strategy_preset = st.selectbox("Strategy preset", options=["Balanced", "Pickup Safe", "Shortest Added Drive", "Highest Density"], index=0)
+            package_soft_warning = st.number_input("Package soft warning threshold", min_value=100.0, max_value=1000.0, value=400.0, step=25.0)
+
+        with st.expander("Advanced strategy weights"):
+            base_weights = up.get_strategy_weights(strategy_preset)
+            w1, w2, w3 = st.columns(3)
+            with w1:
+                pickup_safety = st.slider("Pickup safety", 0.0, 1.0, float(base_weights["pickup_safety"]), 0.01)
+                added_time = st.slider("Total added time", 0.0, 1.0, float(base_weights["added_time"]), 0.01)
+            with w2:
+                proximity = st.slider("Proximity / travel efficiency", 0.0, 1.0, float(base_weights["proximity"]), 0.01)
+                stop_density = st.slider("Stop density improvement", 0.0, 1.0, float(base_weights["stop_density"]), 0.01)
+            with w3:
+                package_burden = st.slider("Package burden", 0.0, 1.0, float(base_weights["package_burden"]), 0.01)
+                fragmentation = st.slider("Area fragmentation", 0.0, 1.0, float(base_weights["fragmentation"]), 0.01)
+            strategy_overrides = {
+                "pickup_safety": pickup_safety,
+                "added_time": added_time,
+                "proximity": proximity,
+                "stop_density": stop_density,
+                "package_burden": package_burden,
+                "fragmentation": fragmentation,
+            }
+
+        with st.expander("Anchor controls"):
+            include_anchors = st.multiselect(
+                "Include only these anchors",
+                options=anchor_options,
+                default=[],
+                format_func=lambda x: f"{anchor_display_map.get(str(x), str(x))}",
+            )
+            prioritize_anchors = st.multiselect(
+                "Prioritize these anchors",
+                options=anchor_options,
+                default=[],
+                format_func=lambda x: f"{anchor_display_map.get(str(x), str(x))}",
+            )
+            exclude_anchors = st.multiselect(
+                "Exclude / protect these anchors",
+                options=anchor_options,
+                default=[],
+                format_func=lambda x: f"{anchor_display_map.get(str(x), str(x))}",
+            )
+
+        st.info("Current cut-run logic uses pickup anchor history plus GAP route-day performance. True geographic maps and traffic-aware reassignment will improve further once anchor geographies or geocoding are connected.")
+
+        if st.button("Run Cut Optimizer"):
+            result = up.build_cut_run_optimizer(
+                gap_route_metrics_df=metrics_wg,
+                pickup_stops_df=pickup_stops_wg,
+                anchor_refs=anchor_refs,
+                day_name=day_name,
+                mode=mode,
+                cut_route=test_route if mode == "test_selected_route" else None,
+                candidate_routes=scope_routes,
+                include_anchors=include_anchors,
+                prioritize_anchors=prioritize_anchors,
+                exclude_anchors=exclude_anchors,
+                strategy_preset=strategy_preset,
+                strategy_overrides=strategy_overrides,
+                package_soft_warning=package_soft_warning,
+            )
+
+            suggestions = _round_df(result.get("suggestions", pd.DataFrame()))
+            selected_plan = result.get("selected_plan", {})
+            scorecard = _round_df(selected_plan.get("scorecard", pd.DataFrame()))
+            cut_summary = _round_df(selected_plan.get("cut_route_summary", pd.DataFrame()))
+            assignment_plan = _round_df(selected_plan.get("assignment_plan", pd.DataFrame()))
+            receiver_summary = _round_df(selected_plan.get("receiver_summary", pd.DataFrame()))
+            weights_show = _round_df(result.get("weights", pd.DataFrame()))
+
+            st.subheader("Strategy weights used")
+            st.dataframe(weights_show, use_container_width=True)
+
+            st.subheader("Suggested cut routes")
+            if suggestions.empty:
+                st.info("No route suggestions available for the selected scope and day.")
+            else:
+                st.dataframe(suggestions, use_container_width=True)
+
+            st.subheader("Selected plan summary")
+            if scorecard.empty:
+                st.warning(selected_plan.get("message", "No plan built."))
+            else:
+                s = scorecard.iloc[0]
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Cut route", int(s["cut_route"]) if pd.notna(s.get("cut_route")) else "—")
+                k2.metric("Feasible", "Yes" if bool(s.get("feasible")) else "No")
+                k3.metric("Overall score", round(float(s.get("overall_score", 0.0)), 1) if pd.notna(s.get("overall_score")) else "—")
+                k4.metric("Total added minutes", round(float(s.get("total_added_minutes", 0.0)), 1) if pd.notna(s.get("total_added_minutes")) else "—")
+                k5, k6, k7, k8 = st.columns(4)
+                k5.metric("Anchors reassigned", int(s.get("anchors_reassigned", 0)))
+                k6.metric("Receiving routes used", int(s.get("receiving_routes_used", 0)))
+                k7.metric("Pickup risk flags", int(s.get("pickup_risk_flags", 0)))
+                k8.metric("Package soft warnings", int(s.get("package_soft_warnings", 0)))
+                st.caption(selected_plan.get("message", ""))
+
+            st.subheader("Cut route baseline")
+            if cut_summary.empty:
+                st.info("No cut-route baseline available.")
+            else:
+                st.dataframe(cut_summary, use_container_width=True)
+
+            st.subheader("Recommended anchor redistribution")
+            if assignment_plan.empty:
+                st.info("No anchor redistribution plan available.")
+            else:
+                assign_cols = [c for c in [
+                    "anchor_display", "anchor_wave", "receiver_route", "receiver_wave", "avg_pickup_stops", "avg_packages",
+                    "median_close_min", "overlap_share", "added_minutes", "pickup_risk_raw", "disqualify", "package_warning", "weighted_score"
+                ] if c in assignment_plan.columns]
+                st.dataframe(assignment_plan[assign_cols], use_container_width=True)
+                st.download_button("Download cut_route_assignment_plan.csv", data=_csv_bytes(assignment_plan), file_name="cut_route_assignment_plan.csv", mime="text/csv")
+
+            st.subheader("Receiving route before / after summary")
+            if receiver_summary.empty:
+                st.info("No receiving route summary available.")
+            else:
+                st.dataframe(receiver_summary, use_container_width=True)
+                chart_df = receiver_summary.set_index("receiver_route")[[c for c in ["base_avg_stops", "new_avg_stops"] if c in receiver_summary.columns]]
+                if not chart_df.empty:
+                    st.bar_chart(chart_df)
+                st.download_button("Download cut_route_receivers.csv", data=_csv_bytes(receiver_summary), file_name="cut_route_receivers.csv", mime="text/csv")
+
+            st.subheader("Anchor flow view")
+            if assignment_plan.empty:
+                st.info("No anchor flow view available.")
+            else:
+                flow = assignment_plan.groupby(["receiver_route"], dropna=False).agg(
+                    assigned_anchors=("anchor_display", "count"),
+                    added_stops=("added_stops", "sum"),
+                    added_packages=("added_packages", "sum"),
+                    added_minutes=("added_minutes", "sum"),
+                ).reset_index()
+                st.dataframe(_round_df(flow), use_container_width=True)
+                st.caption("This view is map-ready but not yet a true geographic map. Once anchor geographies or geocodes are available, this same plan can render spatial before/after maps.")
+
 elif page == "Settings / Exceptions":
     st.header("Settings / Exceptions")
 
+    st.subheader("Route exceptions JSON")
     settings_path = Path(paths["base"]) / "route_exceptions.json"
     if settings_path.exists():
         current_settings = json.loads(settings_path.read_text())
@@ -427,7 +603,7 @@ elif page == "Settings / Exceptions":
             "notes": "",
         }
 
-    edited_json = st.text_area("Edit route exceptions JSON", value=json.dumps(current_settings, indent=2), height=400)
+    edited_json = st.text_area("Edit route exceptions JSON", value=json.dumps(current_settings, indent=2), height=300)
 
     if st.button("Save Exceptions"):
         try:
@@ -436,3 +612,46 @@ elif page == "Settings / Exceptions":
             st.success("Exceptions saved.")
         except Exception as e:
             st.error(f"Invalid JSON: {e}")
+
+    st.markdown("---")
+    st.subheader("Anchor reference manager")
+    st.caption("Upload anchor reference images / files so work-area ownership stays tied to the project.")
+
+    if anchor_refs.empty:
+        st.info("No anchor references uploaded yet.")
+    else:
+        show_anchor = anchor_refs.copy()
+        for c in ["effective_date", "uploaded_at"]:
+            if c in show_anchor.columns:
+                show_anchor[c] = pd.to_datetime(show_anchor[c], errors="coerce")
+        st.dataframe(show_anchor, use_container_width=True)
+
+    with st.form("anchor_upload_form"):
+        uploaded_anchor = st.file_uploader("Upload anchor reference", type=None, accept_multiple_files=False, key="anchor_upload")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            work_area_input = st.text_input("Work area / anchor key")
+        with c2:
+            wave_input = st.selectbox("Wave", options=["", "W1", "W2"])
+        with c3:
+            effective_date = st.date_input("Effective date", value=None)
+        notes = st.text_area("Notes", value="", height=80)
+        save_anchor = st.form_submit_button("Save anchor reference")
+
+    if save_anchor:
+        if uploaded_anchor is None or not work_area_input.strip():
+            st.warning("Please upload a file and enter a work area / anchor key.")
+        else:
+            try:
+                anchor_refs = up.append_or_replace_anchor_reference(
+                    paths=paths,
+                    existing_refs=anchor_refs,
+                    uploaded_file=uploaded_anchor,
+                    work_area_input=work_area_input,
+                    wave=wave_input,
+                    effective_date=effective_date,
+                    notes=notes,
+                )
+                st.success("Anchor reference saved.")
+            except Exception as e:
+                st.error(f"Could not save anchor reference: {e}")

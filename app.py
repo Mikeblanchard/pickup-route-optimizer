@@ -228,7 +228,8 @@ if page == "Update Master Data":
             with st.spinner("Standardizing files..."):
                 gap_excel_std = up.standardize_gap(gap_excel_raw) if not gap_excel_raw.empty else pd.DataFrame()
                 gap_html_stops_std = up.standardize_gap_html_stops(gap_html_stops_raw) if not gap_html_stops_raw.empty else pd.DataFrame()
-                gap_new = pd.concat([gap_excel_std, gap_html_stops_std], ignore_index=True) if not gap_excel_std.empty or not gap_html_stops_std.empty else pd.DataFrame()
+                gap_new_raw = pd.concat([gap_excel_std, gap_html_stops_std], ignore_index=True) if not gap_excel_std.empty or not gap_html_stops_std.empty else pd.DataFrame()
+                gap_new = up.merge_gap_stop_sources(pd.DataFrame(), gap_new_raw)
 
                 pickup_new = up.standardize_pickups(pickup_raw) if not pickup_raw.empty else pd.DataFrame()
                 pickup_stops_new = up.consolidate_physical_pickups(pickup_new) if not pickup_new.empty else pd.DataFrame()
@@ -252,11 +253,7 @@ if page == "Update Master Data":
             st.write("Standardized courier day metric rows:", len(gap_route_metrics_new))
 
             with st.spinner("Appending and deduplicating master tables..."):
-                gap_master_updated = up.append_dedup(
-                    gap_master,
-                    gap_new,
-                    key_cols=["scan_date", "route", "fedex_id", "stop_order", "address", "activity_dt"],
-                )
+                gap_master_updated = up.merge_gap_stop_sources(gap_master, gap_new)
                 pickup_master_updated = up.append_dedup(
                     pickup_master,
                     pickup_new,

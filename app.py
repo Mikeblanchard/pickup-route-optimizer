@@ -41,6 +41,12 @@ gap_master, pickup_master, pickup_stops_master, stop_detail_master, gap_route_me
 if not gap_master.empty:
     gap_route_metrics_master = up.rebuild_gap_metrics_from_master(gap_master, gap_route_metrics_master)
 anchor_refs = up.load_anchor_references(paths)
+courier_name_overrides = up.load_courier_name_overrides(paths)
+courier_reference = up.build_courier_reference(gap_route_metrics_master, gap_master, courier_name_overrides)
+if not gap_master.empty:
+    gap_master = up.apply_courier_name_normalization(gap_master, courier_reference)
+if not gap_route_metrics_master.empty:
+    gap_route_metrics_master = up.apply_courier_name_normalization(gap_route_metrics_master, courier_reference)
 
 
 def _csv_bytes(df: pd.DataFrame) -> bytes:
@@ -278,6 +284,13 @@ if page == "Update Master Data":
                     gap_master_updated,
                     gap_route_metrics_master_updated,
                 )
+                courier_reference_updated = up.build_courier_reference(
+                    gap_route_metrics_master_updated,
+                    gap_master_updated,
+                    courier_name_overrides,
+                )
+                gap_master_updated = up.apply_courier_name_normalization(gap_master_updated, courier_reference_updated)
+                gap_route_metrics_master_updated = up.apply_courier_name_normalization(gap_route_metrics_master_updated, courier_reference_updated)
                 log_new = up.build_ingestion_log_entries(gap_excel_files, pickup_files, stop_detail_files, gap_html_files)
                 ingestion_log_updated = up.append_ingestion_log(ingestion_log, log_new)
 
@@ -290,6 +303,14 @@ if page == "Update Master Data":
                     gap_route_metrics_master_updated,
                     ingestion_log_updated,
                 )
+
+            gap_master = gap_master_updated
+            pickup_master = pickup_master_updated
+            pickup_stops_master = pickup_stops_master_updated
+            stop_detail_master = stop_detail_master_updated
+            gap_route_metrics_master = gap_route_metrics_master_updated
+            ingestion_log = ingestion_log_updated
+            courier_reference = courier_reference_updated
 
             st.success("Master tables updated successfully.")
             st.info("Use Analyze Existing Master to review courier-day performance, route benchmarks, and large gaps.")
@@ -587,6 +608,99 @@ elif page == "Cut Run Optimizer":
 
 elif page == "Settings / Exceptions":
     st.header("Settings / Exceptions")
+
+    st.subheader("Courier name normalization")
+    st.caption("Use FedEx ID as the primary identity and assign one canonical display name per courier.")
+
+    courier_reference = up.build_courier_reference(gap_route_metrics_master, gap_master, courier_name_overrides)
+    if courier_reference.empty:
+        st.info("No courier identities found yet.")
+    else:
+        st.dataframe(courier_reference, use_container_width=True)
+
+    override_options = []
+    if not courier_reference.empty:
+        override_options = [
+            f"{row.fedex_id} — {row.canonical_name or row.suggested_name or 'Unnamed'}"
+            for row in courier_reference.itertuples()
+        ]
+
+    with st.form("courier_name_override_form"):
+        selected_identity = st.selectbox("Courier identity (FedEx ID)", options=override_options if override_options else [""])
+        default_name = ""
+        default_notes = ""
+        if selected_identity:
+            selected_fedex_id = selected_identity.split(" — ")[0].strip()
+            existing_override = courier_name_overrides[courier_name_overrides["fedex_id"].astype(str) == selected_fedex_id] if not courier_name_overrides.empty else pd.DataFrame()
+            if not existing_override.empty:
+                default_name = existing_override["canonical_name"].iloc[0]
+                default_notes = existing_override["notes"].iloc[0] if "notes" in existing_override.columns else ""
+            elif not courier_reference.empty:
+                match_ref = courier_reference[courier_reference["fedex_id"].astype(str) == selected_fedex_id]
+                if not match_ref.empty:
+                    default_name = match_ref["canonical_name"].iloc[0]
+        canonical_name_input = st.text_input("Canonical courier name", value=default_name)
+        canonical_notes_input = st.text_input("Notes", value=default_notes)
+        save_courier_override = st.form_submit_button("Save courier name override")
+
+    if save_courier_override:
+        if not selected_identity:
+            st.warning("Please choose a courier identity.")
+        else:
+            selected_fedex_id = selected_identity.split(" — ")[0].strip()
+            new_row = pd.DataFrame([{
+                "fedex_id": selected_fedex_id,
+                "canonical_name": canonical_name_input,
+                "notes": canonical_notes_input,
+            }])
+            courier_name_overrides = pd.concat([courier_name_overrides, new_row], ignore_index=True)
+            courier_name_overrides = courier_name_overrides.drop_duplicates(subset=["fedex_id"], keep="last").reset_index(drop=True)
+            up.save_courier_name_overrides(paths, courier_name_overrides)
+            courier_reference = up.build_courier_reference(gap_route_metrics_master, gap_master, courier_name_overrides)
+            gap_master = up.apply_courier_name_normalization(gap_master, courier_reference)
+            gap_route_metrics_master = up.apply_courier_name_normalization(gap_route_metrics_master, courier_reference)
+            up.save_master_tables(
+                paths,
+                gap_master,
+                pickup_master,
+                pickup_stops_master,
+                stop_detail_master,
+                gap_route_metrics_master,
+                ingestion_log,
+            )
+            st.success("Courier name override saved.")
+            st.rerun()
+
+    if not courier_name_overrides.empty:
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.dataframe(courier_name_overrides, use_container_width=True)
+        with c2:
+            remove_identity = st.selectbox(
+                "Remove override",
+                options=[""] + courier_name_overrides["fedex_id"].astype(str).tolist(),
+                key="remove_courier_override",
+            )
+            if st.button("Delete courier override"):
+                if remove_identity:
+                    courier_name_overrides = courier_name_overrides[courier_name_overrides["fedex_id"].astype(str) != remove_identity].copy()
+                    up.save_courier_name_overrides(paths, courier_name_overrides)
+                    courier_reference = up.build_courier_reference(gap_route_metrics_master, gap_master, courier_name_overrides)
+                    gap_master = up.apply_courier_name_normalization(gap_master, courier_reference)
+                    gap_route_metrics_master = up.apply_courier_name_normalization(gap_route_metrics_master, courier_reference)
+                    up.save_master_tables(
+                        paths,
+                        gap_master,
+                        pickup_master,
+                        pickup_stops_master,
+                        stop_detail_master,
+                        gap_route_metrics_master,
+                        ingestion_log,
+                    )
+                    st.success("Courier name override removed.")
+                    st.rerun()
+
+    st.markdown("---")
 
     st.subheader("Route exceptions JSON")
     settings_path = Path(paths["base"]) / "route_exceptions.json"

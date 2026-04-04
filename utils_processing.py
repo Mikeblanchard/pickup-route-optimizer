@@ -385,6 +385,89 @@ def append_dedup(master_df, new_df, key_cols):
     return out.reset_index(drop=True)
 
 
+def _gap_source_priority(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.lower()
+    return np.select(
+        [s.eq("gap_html") | s.str.endswith(".html") | s.str.endswith(".htm"),
+         s.eq("gap_excel") | s.str.endswith(".xlsx") | s.str.endswith(".xls") | s.str.endswith(".csv")],
+        [2, 1],
+        default=0,
+    )
+
+
+def _gap_row_richness(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in ["address", "postal_code", "stop_type", "activity_dt", "gap_minutes", "fedex_id", "stat", "fxe_pkgs", "fxg_pkgs", "event_type"] if c in df.columns]
+    if not cols:
+        return pd.Series(0, index=df.index, dtype=float)
+    return df[cols].notna().sum(axis=1)
+
+
+def build_gap_stop_dedup_key(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    d = df.copy()
+    scan_date = pd.to_datetime(d.get("scan_date"), errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    route = pd.to_numeric(d.get("route"), errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+    fedex_id = d.get("fedex_id", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
+    stop_order = pd.to_numeric(d.get("stop_order"), errors="coerce").astype("Int64").astype(str).replace("<NA>", "")
+    address_norm = d.get("address_norm", d.get("address", pd.Series("", index=d.index))).fillna("").astype(str)
+    address_norm = address_norm.apply(normalize_address_for_match)
+    stop_type = d.get("stop_type", pd.Series("", index=d.index)).fillna("").astype(str).str.upper().str.strip()
+    activity_dt = pd.to_datetime(d.get("activity_dt"), errors="coerce")
+    activity_min = activity_dt.dt.floor("min").dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    activity_txt = d.get("activity_time", pd.Series("", index=d.index)).fillna("").astype(str).str.strip()
+    is_event = d.get("is_event_row", d.get("address", pd.Series("", index=d.index)).fillna("").astype(str).str.startswith("*"))
+    event_name = d.get("event_type", d.get("address", pd.Series("", index=d.index))).fillna("").astype(str).str.upper().str.strip()
+
+    customer_key = scan_date + "|" + route + "|" + fedex_id + "|C|" + stop_order + "|" + address_norm + "|" + activity_min + "|" + stop_type
+    event_key = scan_date + "|" + route + "|" + fedex_id + "|E|" + event_name + "|" + activity_min + "|" + activity_txt
+    return pd.Series(np.where(is_event.fillna(False), event_key, customer_key), index=d.index)
+
+
+def merge_gap_stop_sources(master_df: pd.DataFrame | None, new_df: pd.DataFrame | None) -> pd.DataFrame:
+    frames = []
+    if master_df is not None and not master_df.empty:
+        frames.append(master_df.copy())
+    if new_df is not None and not new_df.empty:
+        frames.append(new_df.copy())
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    if "address_norm" not in out.columns and "address" in out.columns:
+        out["address_norm"] = out["address"].apply(normalize_address_for_match)
+    if "is_event_row" not in out.columns and "address" in out.columns:
+        out["is_event_row"] = out["address"].fillna("").astype(str).str.startswith("*")
+    if "source_dataset" not in out.columns:
+        out["source_dataset"] = out.get("source_file", "")
+
+    out["gap_stop_dedup_key"] = build_gap_stop_dedup_key(out)
+    out["_source_priority"] = _gap_source_priority(out.get("source_dataset", out.get("source_file", pd.Series("", index=out.index))))
+    out["_row_richness"] = _gap_row_richness(out)
+    out["_orig_idx"] = range(len(out))
+    out = out.sort_values(["gap_stop_dedup_key", "_source_priority", "_row_richness", "_orig_idx"], ascending=[True, False, False, True]).reset_index(drop=True)
+
+    keep_keys = []
+    merged_rows = []
+    for _, grp in out.groupby("gap_stop_dedup_key", dropna=False, sort=False):
+        base = grp.iloc[0].copy()
+        for col in grp.columns:
+            vals = grp[col]
+            nonnull = vals.dropna()
+            if nonnull.empty:
+                continue
+            if base.get(col) is None or pd.isna(base.get(col)) or (isinstance(base.get(col), str) and str(base.get(col)).strip() == ""):
+                base[col] = nonnull.iloc[0]
+        merged_rows.append(base)
+        keep_keys.append(base["gap_stop_dedup_key"])
+
+    out = pd.DataFrame(merged_rows)
+    drop_cols = [c for c in ["_source_priority", "_row_richness", "_orig_idx"] if c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+    return out.reset_index(drop=True)
+
+
 # -----------------------------
 # Existing GAP Excel / pickup / stop-detail logic
 # -----------------------------
@@ -450,6 +533,7 @@ def standardize_gap(df):
     g["is_pickup_like"] = stop_type_upper.str.contains("PU", na=False)
     g["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
     g["is_event_row"] = g.get("address", pd.Series("", index=g.index)).astype(str).str.startswith("*")
+    g["source_dataset"] = "gap_excel"
     return g
 
 
@@ -1109,6 +1193,7 @@ def standardize_gap_html_stops(df):
     g["is_delivery_like"] = stop_type_upper.str.contains("DL", na=False)
     g["is_event_row"] = g["address"].astype(str).str.startswith("*")
     g["event_type"] = np.where(g["is_event_row"], g["address"].astype(str).str.replace(r"^\*\d+-", "", regex=True).str.upper(), "")
+    g["source_dataset"] = "gap_html"
     return g
 
 

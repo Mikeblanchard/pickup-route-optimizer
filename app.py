@@ -610,18 +610,21 @@ elif page == "Settings / Exceptions":
     st.header("Settings / Exceptions")
 
     st.subheader("Courier name normalization")
-    st.caption("Use FedEx ID as the primary identity and assign one canonical display name per courier.")
+    st.caption("Each unique FedEx ID stays as its own courier record. Only obvious aliases auto-merge; everything else can be reviewed and named here.")
 
     courier_reference = up.build_courier_reference(gap_route_metrics_master, gap_master, courier_name_overrides)
     if courier_reference.empty:
         st.info("No courier identities found yet.")
     else:
+        review_count = int(courier_reference["needs_review"].fillna(False).sum()) if "needs_review" in courier_reference.columns else 0
+        if review_count:
+            st.warning(f"{review_count} courier ID(s) have multiple observed names and should be reviewed.")
         st.dataframe(courier_reference, use_container_width=True)
 
     override_options = []
     if not courier_reference.empty:
         override_options = [
-            f"{row.fedex_id} — {row.canonical_name or row.suggested_name or 'Unnamed'}"
+            f"{row.fedex_id} — {row.display_name or row.canonical_name or row.suggested_name or 'Unnamed'}"
             for row in courier_reference.itertuples()
         ]
 
@@ -638,7 +641,7 @@ elif page == "Settings / Exceptions":
             elif not courier_reference.empty:
                 match_ref = courier_reference[courier_reference["fedex_id"].astype(str) == selected_fedex_id]
                 if not match_ref.empty:
-                    default_name = match_ref["canonical_name"].iloc[0]
+                    default_name = match_ref["canonical_name"].iloc[0] or match_ref["display_name"].iloc[0]
         canonical_name_input = st.text_input("Canonical courier name", value=default_name)
         canonical_notes_input = st.text_input("Notes", value=default_notes)
         save_courier_override = st.form_submit_button("Save courier name override")

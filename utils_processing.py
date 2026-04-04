@@ -2533,3 +2533,130 @@ def build_cut_run_optimizer(
         "selected_plan": selected_plan,
         "weights": pd.DataFrame([weights]),
     }
+
+
+# -----------------------------
+# Courier name normalization
+# -----------------------------
+def load_courier_name_overrides(paths):
+    path = paths["master"] / "courier_name_overrides.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=["fedex_id", "canonical_name", "notes"])
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=["fedex_id", "canonical_name", "notes"])
+    for c in ["fedex_id", "canonical_name", "notes"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str)
+    df = df[df["fedex_id"].str.strip() != ""].copy()
+    df = df.drop_duplicates(subset=["fedex_id"], keep="last").reset_index(drop=True)
+    return df[["fedex_id", "canonical_name", "notes"]]
+
+
+def save_courier_name_overrides(paths, overrides_df):
+    path = paths["master"] / "courier_name_overrides.csv"
+    if overrides_df is None or overrides_df.empty:
+        pd.DataFrame(columns=["fedex_id", "canonical_name", "notes"]).to_csv(path, index=False)
+        return
+    out = overrides_df.copy()
+    for c in ["fedex_id", "canonical_name", "notes"]:
+        if c not in out.columns:
+            out[c] = ""
+        out[c] = out[c].fillna("").astype(str)
+    out = out[out["fedex_id"].str.strip() != ""].drop_duplicates(subset=["fedex_id"], keep="last")
+    out[["fedex_id", "canonical_name", "notes"]].to_csv(path, index=False)
+
+
+def _clean_person_name_basic(name):
+    if pd.isna(name):
+        return ""
+    s = str(name).replace("\xa0", " ").strip()
+    s = re.sub(r"[._]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return ""
+    parts = [p for p in s.split(" ") if p]
+    normalized = []
+    for p in parts:
+        if len(p) == 1:
+            normalized.append(p.upper() + ".")
+        else:
+            normalized.append(p.capitalize())
+    return " ".join(normalized)
+
+
+def _choose_best_courier_name(names):
+    cleaned = [_clean_person_name_basic(x) for x in names if _clean_person_name_basic(x)]
+    if not cleaned:
+        return ""
+    cleaned = list(pd.Series(cleaned).value_counts().index)
+    scored = []
+    for n in cleaned:
+        tokens = len(n.split())
+        initials = sum(1 for t in n.split() if len(t.replace(".", "")) == 1)
+        score = (tokens, -initials, len(n))
+        scored.append((score, n))
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+
+def build_courier_reference(gap_route_metrics_df=None, gap_df=None, overrides_df=None):
+    frames = []
+    for src in [gap_route_metrics_df, gap_df]:
+        if src is None or src.empty:
+            continue
+        cols = [c for c in ["fedex_id", "courier_name"] if c in src.columns]
+        if {"fedex_id", "courier_name"}.issubset(cols):
+            tmp = src[["fedex_id", "courier_name"]].copy()
+            tmp["fedex_id"] = tmp["fedex_id"].fillna("").astype(str).str.strip()
+            tmp["courier_name"] = tmp["courier_name"].fillna("").astype(str).str.strip()
+            tmp = tmp[(tmp["fedex_id"] != "") & (tmp["courier_name"] != "")]
+            if not tmp.empty:
+                frames.append(tmp)
+    if not frames:
+        return pd.DataFrame(columns=["fedex_id", "canonical_name", "suggested_name", "observed_names", "observed_name_count"])
+    combined = pd.concat(frames, ignore_index=True)
+    rows = []
+    override_map = {}
+    if overrides_df is not None and not overrides_df.empty:
+        override_map = dict(zip(overrides_df["fedex_id"].astype(str), overrides_df["canonical_name"].astype(str)))
+    for fedex_id, grp in combined.groupby("fedex_id", dropna=False):
+        observed = sorted({_clean_person_name_basic(x) for x in grp["courier_name"].tolist() if _clean_person_name_basic(x)})
+        suggested = _choose_best_courier_name(observed)
+        canonical = _clean_person_name_basic(override_map.get(str(fedex_id), "")) or suggested
+        rows.append({
+            "fedex_id": str(fedex_id),
+            "canonical_name": canonical,
+            "suggested_name": suggested,
+            "observed_names": " | ".join(observed),
+            "observed_name_count": len(observed),
+        })
+    out = pd.DataFrame(rows).sort_values(["canonical_name", "fedex_id"]).reset_index(drop=True)
+    return out
+
+
+def apply_courier_name_normalization(df, courier_reference_df=None):
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    if "courier_name" in out.columns:
+        out["courier_name"] = out["courier_name"].fillna("").astype(str).map(_clean_person_name_basic)
+    if "fedex_id" not in out.columns:
+        return out
+    out["fedex_id"] = out["fedex_id"].fillna("").astype(str).str.strip()
+    canonical_map = {}
+    if courier_reference_df is not None and not courier_reference_df.empty:
+        canonical_map = dict(
+            zip(
+                courier_reference_df["fedex_id"].fillna("").astype(str),
+                courier_reference_df["canonical_name"].fillna("").astype(str).map(_clean_person_name_basic),
+            )
+        )
+    if "courier_name" not in out.columns:
+        out["courier_name"] = ""
+    mapped = out["fedex_id"].map(canonical_map)
+    out["courier_name"] = np.where(mapped.fillna("").astype(str).str.strip() != "", mapped, out["courier_name"])
+    out["courier_name"] = out["courier_name"].fillna("").astype(str).map(_clean_person_name_basic)
+    return out

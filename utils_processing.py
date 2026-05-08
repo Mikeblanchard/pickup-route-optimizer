@@ -2701,3 +2701,291 @@ def apply_courier_name_normalization(df, courier_reference_df=None):
     out["courier_name"] = np.where(mapped.fillna("").astype(str).str.strip() != "", mapped, out["courier_name"])
     out["courier_name"] = out["courier_name"].fillna("").astype(str).map(_clean_person_name_basic)
     return out
+
+# -----------------------------
+# Route Day Map / geocoding helpers
+# -----------------------------
+def load_geocode_cache(paths):
+    cache_path = Path(paths["cache"]) / "geocode_cache.csv"
+    if not cache_path.exists() or cache_path.stat().st_size == 0:
+        return pd.DataFrame(columns=["query", "latitude", "longitude", "formatted_address", "geocoded_at"])
+    cache = pd.read_csv(cache_path)
+    return cache
+
+
+def save_geocode_cache(paths, cache_df):
+    cache_path = Path(paths["cache"]) / "geocode_cache.csv"
+    cache_df.to_csv(cache_path, index=False)
+
+
+def _route_day_geocode_query(address, postal_code=None):
+    address_clean = clean_text(address) or ""
+    postal_clean = normalize_postal_code(postal_code) if pd.notna(postal_code) else ""
+    parts = [address_clean]
+    if postal_clean:
+        parts.append(postal_clean)
+    parts.append("Ontario")
+    parts.append("Canada")
+    return ", ".join([p for p in parts if p])
+
+
+def _google_geocode_one(query, api_key):
+    import requests
+    if not query or not api_key:
+        return None
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"address": query, "key": api_key, "region": "ca"}
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "OK" and data.get("results"):
+            top = data["results"][0]
+            loc = top.get("geometry", {}).get("location", {})
+            return {
+                "query": query,
+                "latitude": loc.get("lat"),
+                "longitude": loc.get("lng"),
+                "formatted_address": top.get("formatted_address", ""),
+                "geocoded_at": pd.Timestamp.now(),
+            }
+    except Exception:
+        return None
+    return None
+
+
+def geocode_route_day_addresses(df, paths, api_key, station_address=None):
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    cache = load_geocode_cache(paths)
+    if cache.empty:
+        cache = pd.DataFrame(columns=["query", "latitude", "longitude", "formatted_address", "geocoded_at"])
+
+    if "is_event_row" not in out.columns:
+        out["is_event_row"] = out.get("address", pd.Series("", index=out.index)).fillna("").astype(str).str.startswith("*")
+    if "event_type" not in out.columns:
+        out["event_type"] = np.where(out["is_event_row"], out.get("address", pd.Series("", index=out.index)).fillna("").astype(str).str.replace(r"^\*\d+-", "", regex=True).str.upper(), "")
+
+    out["geocode_query"] = np.where(
+        out["is_event_row"],
+        np.where(out["event_type"].isin(["LEAVE BUILDING", "RETURN TO BUILDING"]), station_address or APP_CONFIG["station_address"], ""),
+        out.apply(lambda r: _route_day_geocode_query(r.get("address"), r.get("postal_code")), axis=1),
+    )
+
+    cache_lookup = cache.drop_duplicates(subset=["query"], keep="last").set_index("query") if not cache.empty else pd.DataFrame()
+    latitudes, longitudes = [], []
+    new_rows = []
+
+    for _, row in out.iterrows():
+        query = row.get("geocode_query", "")
+        lat = np.nan
+        lng = np.nan
+        if query and not (isinstance(cache_lookup, pd.DataFrame) and cache_lookup.empty) and query in cache_lookup.index:
+            cached = cache_lookup.loc[query]
+            if isinstance(cached, pd.DataFrame):
+                cached = cached.iloc[-1]
+            lat = cached.get("latitude", np.nan)
+            lng = cached.get("longitude", np.nan)
+        elif query:
+            result = _google_geocode_one(query, api_key)
+            if result is not None:
+                new_rows.append(result)
+                lat = result.get("latitude", np.nan)
+                lng = result.get("longitude", np.nan)
+        latitudes.append(lat)
+        longitudes.append(lng)
+
+    out["latitude"] = latitudes
+    out["longitude"] = longitudes
+
+    # place break events at nearest known stop to keep them visible, but route gap remains broken later
+    known_idx = out[out[["latitude", "longitude"]].notna().all(axis=1)].index.tolist()
+    for idx in out.index:
+        if pd.notna(out.at[idx, "latitude"]) and pd.notna(out.at[idx, "longitude"]):
+            continue
+        if not bool(out.at[idx, "is_event_row"]):
+            continue
+        evt = str(out.at[idx, "event_type"])
+        if evt in {"BEGIN BREAK", "END BREAK"}:
+            prev_known = [j for j in known_idx if j < idx]
+            next_known = [j for j in known_idx if j > idx]
+            anchor_idx = prev_known[-1] if prev_known else (next_known[0] if next_known else None)
+            if anchor_idx is not None:
+                out.at[idx, "latitude"] = out.at[anchor_idx, "latitude"]
+                out.at[idx, "longitude"] = out.at[anchor_idx, "longitude"]
+
+    if new_rows:
+        cache = pd.concat([cache, pd.DataFrame(new_rows)], ignore_index=True)
+        cache = cache.drop_duplicates(subset=["query"], keep="last").reset_index(drop=True)
+        save_geocode_cache(paths, cache)
+
+    return out
+
+
+def enrich_route_day_from_master(route_day_df, gap_master):
+    if route_day_df is None or route_day_df.empty:
+        return route_day_df.copy() if isinstance(route_day_df, pd.DataFrame) else pd.DataFrame()
+    if gap_master is None or gap_master.empty:
+        return route_day_df.copy()
+
+    out = route_day_df.copy()
+    for col in ["scan_date", "route", "fedex_id"]:
+        if col not in out.columns:
+            continue
+
+    scan_dates = pd.to_datetime(out.get("scan_date"), errors="coerce").dt.date.dropna().unique().tolist() if "scan_date" in out.columns else []
+    routes = pd.to_numeric(out.get("route"), errors="coerce").dropna().astype(int).unique().tolist() if "route" in out.columns else []
+    fedex_ids = out.get("fedex_id", pd.Series(dtype=object)).dropna().astype(str).unique().tolist() if "fedex_id" in out.columns else []
+
+    master = gap_master.copy()
+    if scan_dates and "scan_date" in master.columns:
+        master = master[pd.to_datetime(master["scan_date"], errors="coerce").dt.date.isin(scan_dates)].copy()
+    if routes and "route" in master.columns:
+        master = master[pd.to_numeric(master["route"], errors="coerce").isin(routes)].copy()
+    if fedex_ids and "fedex_id" in master.columns:
+        master = master[master["fedex_id"].astype(str).isin(fedex_ids)].copy()
+
+    if master.empty:
+        return out
+    return merge_gap_stop_sources(out, master)
+
+
+def prepare_route_day_map_data(route_day_df, paths, api_key, station_address, order_mode="activity_time", include_station_events=False):
+    if route_day_df is None or route_day_df.empty:
+        return pd.DataFrame(), {}
+
+    d = route_day_df.copy()
+    if "address_norm" not in d.columns and "address" in d.columns:
+        d["address_norm"] = d["address"].apply(normalize_address_for_match)
+    if "is_event_row" not in d.columns:
+        d["is_event_row"] = d.get("address", pd.Series("", index=d.index)).fillna("").astype(str).str.startswith("*")
+    if "event_type" not in d.columns:
+        d["event_type"] = np.where(d["is_event_row"], d.get("address", pd.Series("", index=d.index)).fillna("").astype(str).str.replace(r"^\*\d+-", "", regex=True).str.upper(), "")
+
+    if order_mode == "activity_time" and "activity_dt" in d.columns:
+        d = d.sort_values(["activity_dt", "stop_order" if "stop_order" in d.columns else d.index.name or d.index]).reset_index(drop=True)
+    elif "stop_order" in d.columns:
+        d = d.sort_values(["stop_order", "activity_dt" if "activity_dt" in d.columns else d.index.name or d.index]).reset_index(drop=True)
+    else:
+        d = d.reset_index(drop=True)
+
+    if not include_station_events:
+        # keep customer-like rows and break events only if within customer span markers should show on map if present
+        keep_mask = ~d["is_event_row"] | d["event_type"].isin(["BEGIN BREAK", "END BREAK"])
+        d = d.loc[keep_mask].copy()
+
+    customer_mask = ~d["is_event_row"].fillna(False)
+    d["package_total"] = pd.to_numeric(d.get("package_count"), errors="coerce")
+    if "package_total" in d.columns:
+        d["package_total"] = d["package_total"].fillna(pd.to_numeric(d.get("fxe_pkgs"), errors="coerce").fillna(0) + pd.to_numeric(d.get("fxg_pkgs"), errors="coerce").fillna(0))
+
+    d["is_revisit_exact"] = False
+    if customer_mask.any() and "address_norm" in d.columns:
+        revisit_mask = d.loc[customer_mask, "address_norm"].fillna("").duplicated(keep="first")
+        d.loc[d.loc[customer_mask].index, "is_revisit_exact"] = revisit_mask.values
+
+    d = geocode_route_day_addresses(d, paths=paths, api_key=api_key, station_address=station_address)
+
+    summary = {
+        "mapped_points": int(d[["latitude", "longitude"]].notna().all(axis=1).sum()),
+        "customer_stop_count": int((~d["is_event_row"].fillna(False)).sum()),
+        "event_row_count": int(d["is_event_row"].fillna(False).sum()),
+        "revisit_count": int(d.get("is_revisit_exact", pd.Series(False, index=d.index)).fillna(False).sum()),
+    }
+    return d.reset_index(drop=True), summary
+
+
+def _build_route_day_popup(row):
+    parts = []
+    stop_label = f"Stop {int(row['stop_order'])}" if pd.notna(row.get("stop_order")) else "Event"
+    parts.append(f"<b>{stop_label}</b>")
+    if pd.notna(row.get("activity_dt")):
+        parts.append(f"Time: {pd.to_datetime(row.get('activity_dt')).strftime('%H:%M')}")
+    elif pd.notna(row.get("activity_time")):
+        parts.append(f"Time: {row.get('activity_time')}")
+    if row.get("is_event_row"):
+        parts.append(f"Event: {row.get('event_type', '')}")
+    if pd.notna(row.get("stop_type")) and not row.get("is_event_row"):
+        parts.append(f"Type: {row.get('stop_type')}")
+    if pd.notna(row.get("address")):
+        parts.append(f"Address: {row.get('address')}")
+    if pd.notna(row.get("gap_minutes")):
+        parts.append(f"Gap: {round(float(row.get('gap_minutes')), 1)} min")
+    if pd.notna(row.get("package_total")):
+        parts.append(f"Packages: {int(float(row.get('package_total')))}")
+    service_flags = []
+    for key in ["fo", "po", "so"]:
+        val = pd.to_numeric(pd.Series([row.get(key)]), errors="coerce").iloc[0]
+        if pd.notna(val) and float(val) > 0:
+            service_flags.append(key.upper())
+    if service_flags:
+        parts.append("Flags: " + ", ".join(service_flags))
+    if bool(row.get("is_revisit_exact", False)):
+        parts.append("<b>Repeated exact-address visit</b>")
+    return "<br>".join(parts)
+
+
+def build_route_day_map_html(route_day_df, station_address, show_event_markers=True, width=1200, height=900):
+    import folium
+    if route_day_df is None or route_day_df.empty:
+        return "<p>No mappable route-day rows found.</p>"
+
+    d = route_day_df.copy()
+    d = d[d[["latitude", "longitude"]].notna().all(axis=1)].copy()
+    if d.empty:
+        return "<p>No geocoded route-day points available yet.</p>"
+
+    center = [float(d["latitude"].median()), float(d["longitude"].median())]
+    fmap = folium.Map(location=center, zoom_start=12, control_scale=True, width=width, height=height)
+
+    # station marker
+    station_rows = d[d.get("event_type", pd.Series("", index=d.index)).isin(["LEAVE BUILDING", "RETURN TO BUILDING"])].copy()
+    if not station_rows.empty:
+        srow = station_rows.iloc[0]
+        folium.Marker(
+            location=[float(srow["latitude"]), float(srow["longitude"])],
+            tooltip="Station",
+            popup=station_address,
+            icon=folium.Icon(icon="home", prefix="fa"),
+        ).add_to(fmap)
+
+    # contiguous path with break gaps
+    segment = []
+    break_events = {"BEGIN BREAK", "END BREAK"}
+    for _, row in d.iterrows():
+        latlng = [float(row["latitude"]), float(row["longitude"])]
+        if bool(row.get("is_event_row")) and str(row.get("event_type")) == "BEGIN BREAK":
+            if len(segment) >= 2:
+                folium.PolyLine(segment, weight=4, opacity=0.8).add_to(fmap)
+            segment = []
+            continue
+        if bool(row.get("is_event_row")) and str(row.get("event_type")) == "END BREAK":
+            segment = [latlng]
+            continue
+        segment.append(latlng)
+    if len(segment) >= 2:
+        folium.PolyLine(segment, weight=4, opacity=0.8).add_to(fmap)
+
+    # markers
+    for _, row in d.iterrows():
+        is_event = bool(row.get("is_event_row"))
+        if is_event and not show_event_markers:
+            continue
+        popup_html = _build_route_day_popup(row)
+        tooltip = popup_html.replace("<br>", " | ")
+        if is_event:
+            icon = folium.Icon(icon="pause" if str(row.get("event_type")) in break_events else "info-sign")
+        elif bool(row.get("is_revisit_exact", False)):
+            icon = folium.Icon(icon="repeat", prefix="fa")
+        else:
+            icon = folium.DivIcon(html=f'<div style="font-size: 10pt; font-weight: bold; color: black; background: white; border: 1px solid #333; border-radius: 10px; padding: 2px 6px;">{int(row["stop_order"] if pd.notna(row.get("stop_order")) else 0)}</div>')
+        folium.Marker(
+            location=[float(row["latitude"]), float(row["longitude"])],
+            tooltip=tooltip,
+            popup=folium.Popup(popup_html, max_width=350),
+            icon=icon,
+        ).add_to(fmap)
+
+    fmap.fit_bounds([[d["latitude"].min(), d["longitude"].min()], [d["latitude"].max(), d["longitude"].max()]])
+    return fmap.get_root().render()

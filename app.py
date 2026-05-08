@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 
+import os
+
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import utils_processing as up
 
@@ -16,6 +19,7 @@ page = st.sidebar.radio(
     [
         "Update Master Data",
         "Analyze Existing Master",
+        "Route Day Map",
         "Cut Run Optimizer",
         "Settings / Exceptions",
     ],
@@ -77,6 +81,55 @@ def _round_df(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = out.select_dtypes(include=["number"]).columns
     out[num_cols] = out[num_cols].round(1)
     return out
+
+
+def _get_google_maps_api_key() -> str:
+    candidate_paths = [
+        ("GOOGLE_MAPS_API_KEY",),
+        ("google_maps_api_key",),
+        ("google_maps", "api_key"),
+        ("google", "maps_api_key"),
+        ("google", "api_key"),
+    ]
+    for path in candidate_paths:
+        try:
+            node = st.secrets
+            for key in path:
+                node = node[key]
+            if node:
+                return str(node)
+        except Exception:
+            pass
+    return os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+
+def _load_route_day_upload(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame(), "unknown"
+    file_type = _detect_file_type(uploaded_file)
+    if file_type == "gap_excel":
+        raw = up.read_uploaded_excels([uploaded_file])
+        return up.standardize_gap(raw), file_type
+    if file_type == "gap_html":
+        stop_raw, _metric_raw = up.read_gap_html_file(uploaded_file)
+        return up.standardize_gap_html_stops(stop_raw), file_type
+    if file_type == "stop_detail":
+        raw = up.read_stop_detail_file(uploaded_file)
+        return up.standardize_stop_detail(raw), file_type
+    return pd.DataFrame(), file_type
+
+
+def _get_route_day_selector_options(df: pd.DataFrame):
+    if df is None or df.empty:
+        return [], [], []
+    route_options = sorted(pd.to_numeric(df.get("route"), errors="coerce").dropna().astype(int).unique().tolist()) if "route" in df.columns else []
+    date_options = sorted(pd.to_datetime(df.get("scan_date"), errors="coerce").dropna().dt.date.unique().tolist()) if "scan_date" in df.columns else []
+    courier_options = []
+    if "courier_name" in df.columns:
+        courier_options = sorted([c for c in df["courier_name"].dropna().astype(str).unique().tolist() if c.strip()])
+    elif "fedex_id" in df.columns:
+        courier_options = sorted([str(c) for c in df["fedex_id"].dropna().astype(str).unique().tolist() if str(c).strip()])
+    return route_options, date_options, courier_options
 
 
 def _detect_file_type(file_obj) -> str:
@@ -441,6 +494,120 @@ elif page == "Analyze Existing Master":
             else:
                 st.dataframe(route_day_show, use_container_width=True)
                 st.download_button("Download route_day_summary.csv", data=_csv_bytes(route_day_show), file_name="route_day_summary.csv", mime="text/csv")
+
+elif page == "Route Day Map":
+    st.header("Route Day Map")
+    st.caption("Map the courier's actual worked day in activity-time order from uploaded route-day files.")
+
+    uploaded_route_day = st.file_uploader(
+        "Upload a full route-day file",
+        type=["xlsx", "xls", "csv", "html", "htm"],
+        accept_multiple_files=False,
+        key="route_day_upload",
+        help="Supports GAP Excel, GAP saved HTML, and stop-detail files when they contain route-day stop sequence and times.",
+    )
+
+    if uploaded_route_day is None:
+        st.info("Upload a route-day file to build a map of the courier's actual day.")
+    else:
+        route_day_upload_df, route_day_file_type = _load_route_day_upload(uploaded_route_day)
+        if route_day_upload_df.empty:
+            st.error(f"Could not parse this upload as a supported route-day file. Detected type: {route_day_file_type}")
+        else:
+            st.write("Detected file type:", f"**{route_day_file_type}**")
+            st.write("Parsed rows:", f"**{len(route_day_upload_df):,}**")
+
+            route_options, date_options, courier_options = _get_route_day_selector_options(route_day_upload_df)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                selected_route = st.selectbox("Route", options=route_options if route_options else [None], index=0)
+            with c2:
+                selected_date = st.selectbox("Date", options=date_options if date_options else [None], index=0)
+            with c3:
+                selected_courier = st.selectbox("Courier / ID", options=[""] + courier_options, index=0)
+
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                map_scope = st.radio(
+                    "Map scope",
+                    options=["First customer stop to last customer stop", "Leave building to return to building"],
+                    index=0,
+                )
+            with c5:
+                enrich_from_master = st.checkbox(
+                    "Enrich from saved master data",
+                    value=True,
+                    help="Uploaded file stays primary. Matching master rows only fill blanks and add missing event context.",
+                )
+            with c6:
+                show_event_markers = st.checkbox("Show event markers", value=True)
+
+            build_map = st.button("Build Route Day Map")
+
+            if build_map:
+                route_day_selected = route_day_upload_df.copy()
+                if selected_route is not None and "route" in route_day_selected.columns:
+                    route_day_selected = route_day_selected[pd.to_numeric(route_day_selected["route"], errors="coerce") == int(selected_route)].copy()
+                if selected_date is not None and "scan_date" in route_day_selected.columns:
+                    route_day_selected = route_day_selected[pd.to_datetime(route_day_selected["scan_date"], errors="coerce").dt.date == selected_date].copy()
+                if selected_courier:
+                    if "courier_name" in route_day_selected.columns and selected_courier in route_day_selected["courier_name"].astype(str).tolist():
+                        route_day_selected = route_day_selected[route_day_selected["courier_name"].astype(str) == selected_courier].copy()
+                    elif "fedex_id" in route_day_selected.columns:
+                        route_day_selected = route_day_selected[route_day_selected["fedex_id"].astype(str) == str(selected_courier)].copy()
+
+                if enrich_from_master and not route_day_selected.empty:
+                    route_day_selected = up.enrich_route_day_from_master(route_day_selected, gap_master)
+                    if not courier_reference.empty:
+                        route_day_selected = up.apply_courier_name_normalization(route_day_selected, courier_reference)
+
+                api_key = _get_google_maps_api_key()
+                if not api_key:
+                    st.error("Google Maps API key not found in Streamlit secrets or environment. Add it before using Route Day Map.")
+                elif route_day_selected.empty:
+                    st.warning("No route-day rows remain after applying the current selections.")
+                else:
+                    include_station = map_scope == "Leave building to return to building"
+                    prepared_route_day, map_summary = up.prepare_route_day_map_data(
+                        route_day_selected,
+                        paths=paths,
+                        api_key=api_key,
+                        station_address=up.APP_CONFIG["station_address"],
+                        order_mode="activity_time",
+                        include_station_events=include_station,
+                    )
+
+                    if prepared_route_day.empty:
+                        st.warning("Could not build a mappable route-day from the selected data.")
+                    else:
+                        k1, k2, k3, k4 = st.columns(4)
+                        k1.metric("Mapped points", map_summary.get("mapped_points", 0))
+                        k2.metric("Customer stops", map_summary.get("customer_stop_count", 0))
+                        k3.metric("Event rows", map_summary.get("event_row_count", 0))
+                        k4.metric("Repeated revisits", map_summary.get("revisit_count", 0))
+
+                        map_html = up.build_route_day_map_html(
+                            prepared_route_day,
+                            station_address=up.APP_CONFIG["station_address"],
+                            show_event_markers=show_event_markers,
+                            width=1200,
+                            height=900,
+                        )
+                        components.html(map_html, height=920, width=1200, scrolling=False)
+
+                        st.subheader("Mapped route-day rows")
+                        preview_cols = [c for c in [
+                            "activity_dt", "stop_order", "stop_type", "address", "postal_code", "gap_minutes",
+                            "courier_name", "fedex_id", "is_event_row", "event_type", "is_revisit_exact",
+                            "latitude", "longitude"
+                        ] if c in prepared_route_day.columns]
+                        st.dataframe(prepared_route_day[preview_cols], use_container_width=True)
+                        st.download_button(
+                            "Download mapped_route_day.csv",
+                            data=_csv_bytes(prepared_route_day),
+                            file_name="mapped_route_day.csv",
+                            mime="text/csv",
+                        )
 
 elif page == "Cut Run Optimizer":
     st.header("Cut Run Optimizer")

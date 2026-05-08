@@ -2876,9 +2876,32 @@ def prepare_route_day_map_data(route_day_df, paths, api_key, station_address, or
         d = d.loc[keep_mask].copy()
 
     customer_mask = ~d["is_event_row"].fillna(False)
-    d["package_total"] = pd.to_numeric(d.get("package_count"), errors="coerce")
-    if "package_total" in d.columns:
-        d["package_total"] = d["package_total"].fillna(pd.to_numeric(d.get("fxe_pkgs"), errors="coerce").fillna(0) + pd.to_numeric(d.get("fxg_pkgs"), errors="coerce").fillna(0))
+    # Package count handling
+    # Some uploads have package_count, some have FXE/FXG package columns, and some have none.
+    # Avoid d.get(...).fillna(...) because d.get("missing_column") returns None,
+    # which caused AttributeError in Streamlit when fxe_pkgs/fxg_pkgs were absent.
+    if "package_count" in d.columns:
+        d["package_total"] = pd.to_numeric(d["package_count"], errors="coerce")
+    elif "package_total" not in d.columns:
+        d["package_total"] = np.nan
+
+    fxe_pkgs = (
+        pd.to_numeric(d["fxe_pkgs"], errors="coerce")
+        if "fxe_pkgs" in d.columns
+        else pd.Series(0, index=d.index, dtype="float64")
+    )
+    fxg_pkgs = (
+        pd.to_numeric(d["fxg_pkgs"], errors="coerce")
+        if "fxg_pkgs" in d.columns
+        else pd.Series(0, index=d.index, dtype="float64")
+    )
+
+    fallback_package_total = fxe_pkgs.fillna(0) + fxg_pkgs.fillna(0)
+    d["package_total"] = (
+        pd.to_numeric(d["package_total"], errors="coerce")
+        .fillna(fallback_package_total)
+        .fillna(0)
+    )
 
     d["is_revisit_exact"] = False
     if customer_mask.any() and "address_norm" in d.columns:

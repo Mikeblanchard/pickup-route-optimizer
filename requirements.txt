@@ -1,6 +1,7 @@
 streamlit
 pandas
-openpyxl
+numpy
 beautifulsoup4
 lxml
-numpy
+openpyxl
+folium
